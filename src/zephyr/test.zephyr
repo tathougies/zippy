@@ -1,0 +1,82 @@
+PACKAGE test
+
+DEFINE find-key-in-db ==
+  0 ZIP-DOWN { get to the actual treap in the database }
+  [ SWAP int-compare ] CONS
+  treap-find
+
+EXPORT find-key-in-db
+
+DEFINE find-leftmost-in-treap-rec ==
+  CUR-TAG
+  [ 1 == ]
+  [ 3 ZIP-DOWN { If we're a branch, go left }
+    1 + { increase the level }
+    find-leftmost-in-treap-rec
+  ]
+  [ ZIP-UP { if we're a leaf, go back to the parent }
+    -1 + { decrease the level... We're done since we hit a leaf } ]
+  IFTE
+
+DEFINE find-leftmost-in-treap ==
+  0 find-leftmost-in-treap-rec
+
+EXPORT find-leftmost-in-treap
+
+DEFINE get-value ==
+  1 ZIP-DOWN
+  CUR-ATOM
+  ZIP-UP
+
+EXPORT get-value
+
+DEFINE next-parent ==
+    [ DUP 0 == ] { check the level }
+    [ ]
+    [
+      [ ARG-HOLE 3 == ]
+      [ { we are the left child of the parent, so end at the parent } -1 + ZIP-UP ]
+      [ -1 + ZIP-UP next-parent ]
+      IFTE
+    ]
+    IFTE
+
+DEFINE next-in-treap ==
+  { first check if we have any in the right child }
+  4 ZIP-DOWN
+  CUR-TAG
+  [ 0 == ]
+  [ { This is a leaf, so go back and then up to the parent }
+    ZIP-UP
+    next-parent
+  ]
+  [ 1 +
+    find-leftmost-in-treap-rec { increase the level appropriately } ]
+  IFTE
+
+EXPORT next-in-treap
+
+DEFINE get-n-rec ==
+  [ [ DUP 0 == ] DIP SWAP ]
+  [ [ ZAP ] DIP ]
+  [
+    1 ZIP-DOWN
+    CUR-ATOM
+    SWAP
+    CONS
+    ZIP-UP
+
+    [ -1 +] DIP { Decrease n }
+
+    { next-in-treap expects the level as its first argument. DIP below to the level }
+    [ [ next-in-treap ] DIP ] DIP
+
+    get-n-rec
+  ]
+  IFTE
+
+DEFINE get-n ==
+  []
+  get-n-rec
+
+EXPORT get-n

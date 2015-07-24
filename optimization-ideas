@@ -1,0 +1,25 @@
+* Optimization ideas
+** DONE Remove unnecessary hseeks.
+*** DONE Remove need for truncation by ensuring all writes end at an 8-byte boundary
+*** DONE Get rid of backtracking for writes
+*** DONE Implement cache to prevent unnecessary reads from disk
+** TODO Implement a better data structure for caches so that we can remove old sections from it as well
+** DONE Remove the disk coordinator thread and instead use an MVar to grant threads access to the disk
+*** DONE Put the read cache and ZippyDBHandle into a common MVar of type ZippyDiskState
+** TODO Remove Vector from CompositeD constructor
+   - GHC allocates arrays in blocks of 4k, so this is a waste of space, since most
+     data structures only ever have a few arguments. It may be best to create an
+     algebraic data type that can store anywhere from 0 - 16 (for example) arguments.
+     This might speed up updates, etc, at the cost of a lot more code. However, it would
+     save space. Of course this would limit the amount of arguments a constructor could
+     take, but that may be okay, or we could include Vector's as a backup...
+** DONE Implement an optimized TxF interpreter
+   - The optimized interpreter would not send all the requests to the IO backend.
+     Rather, it would do most reads and writes itself, and do the appropriate logging.
+     It would only send requests to the core server when it finally wants to commit
+     the transaction, or it received a user request to rebase onto the newest version.
+** TODO Implement optimized TransactionLog
+   - Instead of recording all moves... simply record the minimal path necessary to get to
+     the next read/write. This would decrease commit time at the expense of increasing
+     log recording time. However, it could save log recording time too... it's hard to know..
+** TODO Impement joy or factor-like language for this

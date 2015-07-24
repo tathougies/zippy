@@ -1,0 +1,10 @@
+*~
+.#~
+#*
+.cabal-sandbox
+cabal.sandbox.config
+*-db
+profiles
+pgdata
+dist
+perf-sandbox

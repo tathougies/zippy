@@ -1,0 +1,57 @@
+PACKAGE base
+
+DATA FindResult ==
+  CONS Found
+  CONS NotFound
+
+DATA CmpResult ==
+  CONS LT
+  CONS EQ
+  CONS GT
+
+DATA Bool ==
+  CONS False
+  CONS True
+
+DEFINE int-compare ==
+  { We now have the following on the stack a b. Return 0 if a == b, -1 if a < b, 1 if a > b }
+  [ DUP ] DIP SWAP { copy the a b in order to the top of the stack }
+  [ DUP ] DIP SWAP
+  [ == ]
+  [ ZAP ZAP EQ]
+  [
+    { Now we have a b in order on top of the stack }
+    [ < ]
+    [ LT ]
+    [ GT ]
+    IFTE
+  ]
+  IFTE
+
+DEFINE switch ==
+  [ DUP null? ]
+  [ "No cases matched" FAIL ]
+  [
+    { Now we have our quoted program of quoted programs of the form
+      [
+        [ cond1 expr1 ]
+        [ cond2 expr2 ]
+      ]
+    }
+    UNCONS
+    { Now we've popped the first cond/expr pair off the stack }
+    UNCONS
+    [ UNCONS SWAP ZAP ] DIP
+    { Now the stack has cond at the top and the expression to run if cond succeeds
+      then comes the list of remaining conditions and the recursive function }
+    { Now we have a stack that looks like:
+      then-part cond }
+    SWAP
+    [ SWAP ZAP I ]
+    [ ZAP switch ]
+    IFTE
+  ]
+  IFTE
+
+DEFINE null? ==
+  LENGTH 0 ==

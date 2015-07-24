@@ -1,0 +1,91 @@
+PACKAGE treaps
+
+DATA Treap ==
+  CONS Leaf
+  CONS Branch key=Int value=Text prio=Integer left=Treap right=Treap
+{  DEFAULT Leaf}
+
+DEFINE treap-find-with-level ==
+  { We expect two arguments on the stack.
+    The level and a key comparator }
+  [ [ [ CUR-TAG IS-Branch? ]
+      [ [ DUP CUR-ATOM SWAP I ] VISIT-key
+        [ [ [ DUP IS-LT? ] [
+	    ZAP
+	    MOVETO-left
+	    [ 1 + ] DIP
+	    treap-find-with-level ] ]
+	  [ [ DUP IS-GT? ] [
+	    ZAP
+	    MOVETO-right
+	    [ 1 + ] DIP
+	    treap-find-with-level ] ]
+	  [ [ DUP IS-EQ? ] [
+	    ZAP ZAP Found ] ]
+	] switch
+      ] ]
+
+    [ [ CUR-TAG IS-Leaf? ]
+      [ ZAP NotFound ] ]
+  ] switch
+
+{
+DEFINE treap-find-with-level ==
+  CUR-TAG
+    [ 0 == ]
+    [ ZAP "not-found" { Not Found ) ]
+    [ 0 { key ) ZIP-DOWN
+      DUP
+      CUR-ATOM
+      SWAP I { Run the key comparator )
+      ZIP-UP
+
+      [ 3 { left ) ZIP-DOWN
+        [1 +] DIP { Increment the level )
+	treap-find ] { LT )
+      [ ZAP "found" { Found ) ] { EQ )
+      [ 4 { right ) ZIP-DOWN
+        [1 +] DIP { Increment the level )
+	treap-find ] { GT )
+      SWITCH-COMPARISON-RESULT
+    ]
+    IFTE
+}
+
+DEFINE treap-find ==
+    0 SWAP
+    treap-find-with-level
+    SWAP ZAP
+
+DEFINE SWITCH-COMPARISON-RESULT ==
+    { first we're going to check the greater than condition, which is at the top of the stack }
+    { we're now going to pull the result to the top of the stack }
+    [ [ [ DUP ] DIP SWAP ] DIP SWAP ] DIP SWAP
+
+    { GT case }
+    [ 1 == ]
+    { If the result was GT, then get rid of the LT case, EQ case, and the comparison result and run the GT case }
+    [ [ ZAP ZAP ZAP ] DIP I ]
+    { Otherwise, try the eq and lt cases }
+    [ { get rid of GT case }
+      ZAP
+      { Now we have the eq, lt, and result on the stack... We're going to reach in and pull the result to the top again }
+      [ SWAP ] DIP SWAP
+
+      [ 0 == ]
+      { If the result was EQ, then get rid of the lt case, and run the eq case }
+      [ [ ZAP ] DIP I ]
+      { otherwise, get rid of the eq case and run the lt case }
+      [ ZAP I ]
+      IFTE
+    ]
+    IFTE
+
+DEFINE treap-up-to-root ==
+    [ DUP 0 == ]
+    [ ZAP ]
+    [ UP
+      -1 +
+      treap-up-to-root
+    ]
+    IFTE
