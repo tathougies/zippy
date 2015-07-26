@@ -40,7 +40,7 @@ var q = async.queue(function ( data, allDone ) {
 	});
     }
     tryAgain();
-},  2);
+},  10);
 
 q.drain = function () {
     console.log("all done");

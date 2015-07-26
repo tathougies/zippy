@@ -2,13 +2,16 @@ PACKAGE treaps
 
 DATA Treap ==
   CONS Leaf
-  CONS Branch key=Int value=Text prio=Integer left=Treap right=Treap
+  CONS Branch key=Integer value=Text prio=Integer left=Treap right=Treap
 {  DEFAULT Leaf}
+
+DATA TreapsDatabase ==
+  CONS TreapsDatabase Treap
 
 DEFINE treap-find-with-level ==
   { We expect two arguments on the stack.
     The level and a key comparator }
-  [ [ [ CUR-TAG IS-Branch? ]
+  [ [ [ CUR-IS-Branch? ]
       [ [ DUP CUR-ATOM SWAP I ] VISIT-key
         [ [ [ DUP IS-LT? ] [
 	    ZAP
@@ -25,7 +28,7 @@ DEFINE treap-find-with-level ==
 	] switch
       ] ]
 
-    [ [ CUR-TAG IS-Leaf? ]
+    [ [ CUR-IS-Leaf? ]
       [ ZAP NotFound ] ]
   ] switch
 
@@ -84,8 +87,128 @@ DEFINE SWITCH-COMPARISON-RESULT ==
 DEFINE treap-up-to-root ==
     [ DUP 0 == ]
     [ ZAP ]
-    [ UP
+    [ ZIP-UP
       -1 +
       treap-up-to-root
     ]
     IFTE
+
+DEFINE check-treap-property ==
+  { check that our priority is less than our parent's }
+  [ CUR-ATOM ] VISIT-prio
+  ZIP-UP
+  [ CUR-ATOM ] VISIT-prio
+  { stack is now parent-prio, our-prio }
+  SWAP
+  { now our-prio, parent-prio }
+  > { check if parent-prio > our-prio }
+
+DEFINE rotate-me-left ==
+  [ [ CUT ] VISIT-left CUT ] VISIT-right
+
+  CUT
+  { Now a cut version of parent is at the top of the stack.
+    We want to replace parent.right with parent.right.left }
+  [ [
+    { the stack is now parent.right (cut), parent.right.left }
+    [ ZIP-REPLACE ] DIP
+  ]  VISIT-right ]  ENTER-ZIPPER
+  { Now we have the new parent at the top of the stack and then
+    the cut of parent.right }
+  SWAP
+  { Now we enter the parent.right cut and set left to the parent }
+  [ [
+    { Now we have the parent cut on top of stack }
+    ZIP-REPLACE
+  ] VISIT-left ] ENTER-ZIPPER
+
+  ZIP-REPLACE { SPLICE takes the zipper at the top of the stack, brings it to the root }
+
+DEFINE rotate-me-right ==
+  [ [ CUT ] VISIT-right CUT ] VISIT-left
+
+  CUT
+  { Now a cut version of parent is at the top of the stack.
+    We want to replace parent.left with parent.left.right }
+  [ [
+    { the stack is now parent.left (cut), parent.left.right }
+    [ ZIP-REPLACE ] DIP
+  ]  VISIT-left ]  ENTER-ZIPPER
+  { Now we have the new parent at the top of the stack and then
+    the cut of parent.left }
+  SWAP
+  { Now we enter the parent.left cut and set right to the parent }
+  [ [
+    { Now we have the parent cut on top of stack }
+    ZIP-REPLACE
+  ] VISIT-right ] ENTER-ZIPPER
+
+  ZIP-REPLACE { SPLICE takes the zipper at the top of the stack, brings it to the root }
+
+
+DEFINE rotate-treap ==
+  { top of stack is level }
+  [ DUP 0 == ]
+  [ ZAP { We're done... get rid of level }]
+  [
+    CHK-HOLE-right
+    [ check-treap-property ]
+    [ { we have the cheap property, so decrement level and move to top }
+      ZAP { get rid of the child indicator }
+      -1 +
+      [ ZIP-UP ] replicate-n
+    ]
+    [
+      [ IS-False? ]
+      [ { we're the left child }
+        rotate-me-right
+	-1 +
+	rotate-treap
+      ]
+      [ { we're the right child }
+        rotate-me-left
+	-1 +
+	rotate-treap
+      ]
+      IFTE
+    ]
+    IFTE
+  ]
+  IFTE
+
+{ stack should look like newPrio, key, val, keycmp }
+DEFINE treap-insert ==
+  [ [ [ 0 SWAP treap-find-with-level ZAP ] DIP SWAP ] DIP SWAP ] DIP SWAP
+  { now stack looks like lvl, newPrio, key, val, keycmp }
+  { we're also at the place where we should insert the node }
+  [ [ [ CUR-IS-Leaf? ]
+      [
+        { stack looks like lvl, newPrio, key, val, keycmp }
+	{ we need it to be Leaf, Leaf, newPrio, val, key }
+	[ [ SWAP ] DIP
+	  { now the stack looks like newPrio, val, key }
+	  Leaf Leaf
+	  { now the stack looks like leaf, leaf, newprio, val, key }
+	  Branch
+	  { now we have the new branch, so we can replace }
+	  ZIP-REPLACE
+	] DIP
+	{ now we just have lvl, keycmp on the stack }
+	rotate-treap
+	{ now we just have keycmp }
+	ZAP
+      ] ]
+
+    [ [ CUR-IS-Branch? ]
+      [ { We only arrive here if the key alread exists so just replace the value }
+        { the stack looks like lvl, newPrio, key, val, keycmp }
+	{ we want val, lvl }
+	[ ZAP ZAP [ ZAP ] DIP ] DIP
+	{ now we have lvl, val }
+	SWAP
+	{ now we have val, lvl }
+	[ ZIP-REPLACE ] VISIT-value
+	{ new he have just lvl }
+	[ ZIP-UP ] repeat-n
+      ] ]
+  ] switch

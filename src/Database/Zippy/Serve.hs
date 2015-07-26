@@ -58,14 +58,14 @@ data ZippyServeSettings =
     ZippyServeSettings
     { rootsPath  :: FilePath
     , dataPath   :: FilePath
-    , schemaPath :: FilePath
 
     , serverAddress :: HostPreference
     , serverPort    :: Int
 
     , dataCacheSize :: Word64
 
-    , zephyrPackageDirectory :: FilePath }
+    , zephyrPackageDirectory :: FilePath
+    , zephyrRootTyName :: ZippyTyName}
 
 data ServeCmd = MoveUpCmd
               | MoveDownCmd !Int
@@ -166,7 +166,7 @@ serveRequest txnsChan txnId exportedZephyr sch (curTy, _) cmd =
                Left err -> return (curTy, fromString ("error parsing stack: " ++ show err ++ "\n"))
                Right stk ->
                    case HM.lookup (ZephyrWord cmdName) exportedZephyr of
-                     Just zephyrProg -> do res <- interpretTxAsync sch ResyncAfterTx txnsChan txnId (runZephyr zephyrProg stk)
+                     Just zephyrProg -> do res <- interpretTxAsync sch ResyncAfterTx txnsChan txnId (runZephyr zephyrProg sch stk)
                                            return (curTy, fromString (show res ++ "\n"))
                      Nothing -> return (curTy, fromString ("No such zephyr query: " ++ show cmdName))
 
@@ -204,10 +204,7 @@ loadZephyrPackages zephyrDir =
 
 serveZippy :: ZippyServeSettings -> IO ()
 serveZippy (ZippyServeSettings { .. }) =
-    do infoM "serveZippy" "Loading schema..."
-       schema <- readSchemaFromFile schemaPath
-
-       infoM "serveZippy" "Looking for initial root..."
+    do infoM "serveZippy" "Looking for initial root..."
        initialRoot <- findRootFromRootsFile rootsPath
        infoM "serveZippy" ("Found root at " ++ show initialRoot)
 
@@ -225,10 +222,7 @@ serveZippy (ZippyServeSettings { .. }) =
                           return ret
 
        zephyrPackages <- loadZephyrPackages zephyrPackageDirectory
-       let exports = HM.fromList $
-                     concatMap (\pkg -> map (\main -> (main, compileZephyr (zephyrPackages `withoutPackage` pkg) pkg main)) (zephyrExports pkg)) zephyrPackages
-
-           withoutPackage pkgs pkg = filter (\pkg' -> zephyrPackageName pkg' /= zephyrPackageName pkg) pkgs
+       let (exports, schema) = compilePackages zephyrPackages zephyrRootTyName
 
        infoM "serveZippy" ("Loaded packages " ++ show (map zephyrPackageName zephyrPackages))
 

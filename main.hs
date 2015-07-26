@@ -4,6 +4,7 @@ module Main where
 import Control.Concurrent
 import Control.Concurrent.MVar
 
+import Database.Zippy.Types
 import Database.Zippy.Serve (ZippyServeSettings (..), serveZippy)
 import Database.Zippy.Persist
 import Database.Zippy.Disk
@@ -26,11 +27,11 @@ opts = info (helper <*> (ZippyServeCmdLine <$> settings <*> verbosity <*> stats)
     where settings = ZippyServeSettings
                  <$> (strOption (long "roots-path" <> short 'r' <> metavar "ROOTPATH" <> help "Path to roots.db") <|> pure "roots.db")
                  <*> (strOption (long "data-path" <> short 'd' <> metavar "DATAPATH" <> help "Path to data.db") <|> pure "data.db")
-                 <*> (strOption (long "schema-path" <> short 's' <> metavar "SCHEMAPATH" <> help "Path to schema.txt") <|> pure "schema.txt")
                  <*> (fromString <$> (strOption (long "host" <> short 'h' <> metavar "HOST" <> help "host to bind on") <|> pure "*"))
                  <*> (argument auto (metavar "PORT" <> help "Port to bind to"))
                  <*> (read <$> strOption (long "cache-size" <> short 'C' <> metavar "SIZE" <> help "Cache size") <|> pure 1000000)
                  <*> (strOption (long "zephyr-dir" <> short 'Z' <> metavar "ZEPHYR-PATH" <> help "Path to zephyr packages"))
+                 <*> (ZippyTyName "" . fromString <$> (strOption (long "root-type" <> short 'T' <> metavar "ROOT-TYPE" <> help "The name of the root database type")))
 
           verbosity = flag Normal Verbose (long "verbose" <> short 'v')
           stats = flag StatsOff StatsOn (long "stats" <> short 'S')

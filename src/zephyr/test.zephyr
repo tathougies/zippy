@@ -7,6 +7,14 @@ DEFINE find-key-in-db ==
 
 EXPORT find-key-in-db
 
+DEFINE insert-key-in-db ==
+  0 ZIP-DOWN { get to the actual treap in the database }
+  [ SWAP [ DUP [ SWAP int-compare ] CONS SWAP ] DIP SWAP ] DIP
+  treap-insert
+  ZIP-UP
+
+EXPORT insert-key-in-db
+
 DEFINE find-leftmost-in-treap-rec ==
   CUR-TAG
   [ 1 == ]
@@ -80,3 +88,11 @@ DEFINE get-n ==
   get-n-rec
 
 EXPORT get-n
+
+{ A Zephyr type system
+
+  insert :: Comparable k => k -> v -> (*A > Treap k v) -> (*A > Treap k v)
+  insert k v t@(Branch key value prio left right)
+    | k < key -> t { left ~= insert
+
+  }

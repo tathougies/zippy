@@ -24,12 +24,14 @@ module Database.Zippy.Types
     , TxF(..), Tx(..), TxnStepsChan(..), TxCommitStatus(..)
     , txnStepTxnId
 
-    , move, cur, childRef, curTy, parentArgHole, commit, abort
+    , move, moveOOB, cur, cut, childRef, curTy, parentArgHole, commit, abort
 
     , TxnId(..), RunTxnStepFn(..), TxnStep(..)
     , TxState(..), ZippyState(..), zippyRootType
 
     , ZippyDiskState(..), ZippyDiskCache(..), emptyDiskCache
+
+    , spineStrictMap
     ) where
 
 import Control.Monad.Free.Church
@@ -284,6 +286,10 @@ data TxF next = MoveTx !Movement (MoveResult -> next)
               | ParentArgHoleTx (Maybe Int -> next)
               | CurTyTx ((ZippyT, ZippySchema) -> next)
 
+              -- Zipper cutting
+              | CutTx (Zipper -> next)
+              | MoveOOBTx !Zipper !Movement ((Zipper, MoveResult) -> next)
+
               | RebaseTx !RebaseFailureMode next
               | CommitTx (TxCommitStatus -> next)
               | AbortTx
@@ -295,8 +301,14 @@ type TxnStepsChan = Chan TxnStep
 move :: Movement -> Tx MoveResult
 move movement = liftF (MoveTx movement id)
 
+moveOOB :: Zipper -> Movement -> Tx (Zipper, MoveResult)
+moveOOB z movement = liftF (MoveOOBTx z movement id)
+
 cur :: Tx CurResult
 cur = liftF (CurTx id)
+
+cut :: Tx Zipper
+cut = liftF (CutTx id)
 
 curTy :: Tx (ZippyT, ZippySchema)
 curTy = liftF (CurTyTx id)
@@ -405,3 +417,10 @@ data ZippyDiskState = ZippyDiskState
                     , zippyDataHandle :: Handle
 
                     , zippyDataCache  :: !ZippyDiskCache }
+
+spineStrictMap :: (a -> b) -> [a] -> [b]
+spineStrictMap f [] = []
+spineStrictMap f (x:xs) = let !x' = f x
+                              !xs' = spineStrictMap f xs
+                              !r = x':xs'
+                          in r

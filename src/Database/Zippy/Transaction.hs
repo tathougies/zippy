@@ -378,7 +378,9 @@ interpretTxAsync' !settings !st (Free (MoveTx movement next)) =
     do (z, res, TxAsyncDiskState cache' _ _ _) <- moveZipper (asyncDiskState settings st) (asyncCurSchema settings) movement (asyncCurZipper st)
        interpretTxAsync' settings (st { asyncDiskCache = cache'
                                       , asyncCurZipper = z
-                                      , asyncInterpreterLog = recordMove movement (asyncInterpreterLog st) })
+                                      , asyncInterpreterLog = case res of
+                                                                Moved _ -> recordMove movement (asyncInterpreterLog st)
+                                                                _ -> asyncInterpreterLog st })
                                   (next res)
 interpretTxAsync' !settings !st (Free (CurTx next) :: Free TxF a) =
     {-# SCC curTx #-}
@@ -417,6 +419,12 @@ interpretTxAsync' !settings !st (Free (CurTyTx next)) =
     {-# SCC curTyTx #-}
     case asyncCurZipper st of
       Zipper _ curTy _ _ -> interpretTxAsync' settings st (next (curTy, asyncCurSchema settings))
+interpretTxAsync' !settings !st (Free (CutTx next)) =
+    interpretTxAsync' settings st (next (removeCtxt (asyncCurZipper st)))
+    where removeCtxt (Zipper modState ty d _) = Zipper modState ty d []
+interpretTxAsync' !settings !st (Free (MoveOOBTx zipper mvmt next)) =
+    do (zipper', res, TxAsyncDiskState cache' _ _ _) <- moveZipper (asyncDiskState settings st) (asyncCurSchema settings) mvmt zipper
+       interpretTxAsync' settings (st { asyncDiskCache = cache' }) (next (zipper', res))
 
 -- | The asynchronous interpreter is like the synchronous one, except it also keeps track of
 --   a copy of the disk cache. It uses that copy to quickly respond to read requests. When
