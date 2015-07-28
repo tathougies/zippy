@@ -104,6 +104,7 @@ DEFINE check-treap-property ==
   > { check if parent-prio > our-prio }
 
 DEFINE rotate-me-left ==
+  "left rotate" LOG
   [ [ CUT ] VISIT-left CUT ] VISIT-right
 
   CUT
@@ -125,6 +126,7 @@ DEFINE rotate-me-left ==
   ZIP-REPLACE { SPLICE takes the zipper at the top of the stack, brings it to the root }
 
 DEFINE rotate-me-right ==
+  "right rotate" LOG
   [ [ CUT ] VISIT-right CUT ] VISIT-left
 
   CUT
@@ -211,4 +213,16 @@ DEFINE treap-insert ==
 	{ new he have just lvl }
 	[ ZIP-UP ] repeat-n
       ] ]
+  ] switch
+
+DEFINE treap-height ==
+  [ [ [ CUR-IS-Branch? ]
+      [ [ treap-height ] VISIT-left
+        [ treap-height ] VISIT-right
+	max
+	1 +
+      ] ]
+
+    [ [ CUR-IS-Leaf? ]
+      [ 0 ] ]
   ] switch

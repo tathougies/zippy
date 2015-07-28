@@ -3,6 +3,7 @@ PACKAGE test
 DEFINE find-key-in-db ==
   0 ZIP-DOWN { get to the actual treap in the database }
   [ SWAP int-compare ] CONS
+  0 SWAP
   treap-find
 
 EXPORT find-key-in-db
@@ -65,34 +66,83 @@ DEFINE next-in-treap ==
 EXPORT next-in-treap
 
 DEFINE get-n-rec ==
-  [ [ DUP 0 == ] DIP SWAP ]
-  [ [ ZAP ] DIP ]
+  [ DUP 0 == ]
+  [ ]
   [
-    1 ZIP-DOWN
-    CUR-ATOM
-    SWAP
-    CONS
-    ZIP-UP
+    [ CUT YIELD ] VISIT-value
 
-    [ -1 +] DIP { Decrease n }
+    -1 + { Decrease n }
 
     { next-in-treap expects the level as its first argument. DIP below to the level }
-    [ [ next-in-treap ] DIP ] DIP
+    [ next-in-treap ] DIP
 
     get-n-rec
   ]
   IFTE
 
 DEFINE get-n ==
-  []
   get-n-rec
 
 EXPORT get-n
 
-{ A Zephyr type system
+DEFINE yield-this ==
+  CUT YIELD
 
-  insert :: Comparable k => k -> v -> (*A > Treap k v) -> (*A > Treap k v)
-  insert k v t@(Branch key value prio left right)
-    | k < key -> t { left ~= insert
+EXPORT yield-this
 
-  }
+DEFINE db-height ==
+  CUT { this is a read-only transaction, so we can cut the zipper here, and operate on a read-only replica }
+  [ 0 ZIP-DOWN
+    treap-height
+    ZIP-UP ] ENTER-ZIPPER
+  ZAP
+
+EXPORT db-height
+
+DATA ProductsDatabase ==
+  CONS ProductsDatabase products=(Treap Text Product)
+
+DATA Product ==
+  CONS Product sku=Text type=ProductType title=Text description=Text pricing=PricingDetails
+
+DATA ProductType ==
+  CONS AudioCD
+  CONS DVD
+  CONS VideoGame
+
+DATA ProductCategory ==
+  CONS Jazz
+  CONS Action
+  CONS RockNRoll
+  CONS Adventure
+  CONS Comedy
+  CONS Music
+
+DATA PricingDetails ==
+  CONS PricingDetails (list : Floating) (savings : Floating)
+
+DEFINE insert-product ==
+  [ "dipped below prio" LOG
+    [
+      [ CUR-ATOM ] VISIT-sku
+      DUP
+      [ SWAP int-compare ] CONS
+      SWAP { now stack is key, keycmp }
+    ] ENTER-ZIPPER
+    { now stack is val, key, keycmp }
+    SWAP
+  ] DIP
+  treap-insert
+
+DEFINE insert-products ==
+  [ "01234567" AudioCD "John Coltrane" "Some cool music" 5.89 0.10 PricingDetails
+    Product
+    10 { prio ... TODO Generate RANDOM }
+    insert-product
+
+    { "99999999" DUP DVD "Jurassic Park" "Cool movie about dinosaurs" 30.00 1 PricingDetails SWAP
+    14
+    insert-product}
+    ] VISIT-products
+
+EXPORT insert-products

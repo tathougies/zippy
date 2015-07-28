@@ -5,7 +5,11 @@ module Database.Zippy.Transaction
 
     , interpretTxSync
 
-    , interpretTxAsync, ShouldResync(..) ) where
+    , interpretTxAsync, ShouldResync(..)
+
+    , canonicalBuilderForZipper, emptyAsyncDiskState) where
+
+import Prelude hiding (foldlM)
 
 import Database.Zippy.Types
 import Database.Zippy.Data
@@ -22,11 +26,15 @@ import Data.IORef
 import Data.Monoid
 import Data.Sequence (viewr, viewl, ViewL(..), ViewR(..), (|>), (<|))
 import Data.Word
+import Data.ByteString.Builder
+import Data.Foldable (foldlM)
+import Data.String
+import qualified Data.Text.Encoding as TE
 import qualified Data.Sequence as Seq
 import qualified Data.HashMap.Strict as HM
 import qualified Data.Vector as V
 
-import System.IO
+import System.IO hiding (char8)
 import System.Log.Logger
 
 data TxLogVerificationResult = TxLogVerified !InMemoryD
@@ -145,16 +153,7 @@ serveDesynced st txn nextStep =
           do modifyIORef (zippyTxns st) (HM.insert txnId (TxState z' log' (txRootAtStart txn)))
              putMVar retV ()
       TxnStepCommitLog txnId log' retV -> doCommit st txnId log' retV
-      TxnStepDesyncedRead txnId ty diskOffs retV ->
-          do diskState <- readIORef (zippyDiskState st)
-             res <- lookupCache (zippyDataCache diskState) diskOffs
-             case res of
-               Just (ret, cache') ->
-                   do writeIORef (zippyDiskState st) (diskState { zippyDataCache = cache' })
-                      putMVar retV (cache', ret)
-               Nothing -> do (ret, diskState') <- coordinateReadZippyD diskState ty diskOffs
-                             writeIORef (zippyDiskState st) diskState'
-                             putMVar retV (zippyDataCache diskState', ret)
+      TxnStepDesyncedRead txnId ty diskOffs retV -> doDesyncedRead st ty diskOffs retV
       _ -> fail "Sync command in desynced transaction"
 
 serveSynced :: ZippyState -> TxState -> TxnStep -> IO ()
@@ -199,11 +198,23 @@ serveSynced st txn nextStep =
                   Just arg -> putMVar retV (Just arg)
             _ -> putMVar retV Nothing
       TxnStepCommit txnId retV -> doCommit st txnId (txLog txn) retV
+      TxnStepDesyncedRead txnId ty diskOffs retV -> doDesyncedRead st ty diskOffs retV
       TxnStepDesynchronize txnId retV ->
           do diskState <- readIORef (zippyDiskState st)
              modifyIORef (zippyTxns st) (HM.insert txnId (TxDesynced (txRootAtStart txn)))
              putMVar retV (txZipper txn, zippyDataCache diskState, txLog txn)
       _ -> fail "Received async request from sync transaction"
+
+doDesyncedRead st ty diskOffs retV =
+    do diskState <- readIORef (zippyDiskState st)
+       res <- lookupCache (zippyDataCache diskState) diskOffs
+       case res of
+         Just (ret, cache') ->
+             do writeIORef (zippyDiskState st) (diskState { zippyDataCache = cache' })
+                putMVar retV (cache', ret)
+         Nothing -> do (ret, diskState') <- coordinateReadZippyD diskState ty diskOffs
+                       writeIORef (zippyDiskState st) diskState'
+                       putMVar retV (zippyDataCache diskState', ret)
 
 doCommit st txnId txLog retV =
     do let finishWriteOutDb disk db =
@@ -229,6 +240,8 @@ doCommit st txnId txLog retV =
                                                 return TxCannotMerge
        -- Regardless of the commit status, this transaction is now dead...
        modifyIORef (zippyTxns st) (HM.delete txnId)
+       sz <- HM.size <$> readIORef (zippyTxns st)
+       infoM "serveZippy" ("# txns: " ++ show sz)
        putMVar retV status
 
 rezip :: ZippyDiskState -> ZippySchema -> Zipper -> IO (InMemoryD, ZippyDiskState)
@@ -355,7 +368,9 @@ data TxAsyncInterpretSettings =
     , asyncCurSchema        :: !ZippySchema
 
     , asyncTxnsChan         :: !TxnStepsChan
-    , asyncTxnId            :: !TxnId }
+    , asyncTxnId            :: !TxnId
+
+    , asyncLogAction        :: TxLogAction -> IO () }
 
 data TxAsyncInterpretState =
     TxAsyncInterpretState
@@ -425,6 +440,9 @@ interpretTxAsync' !settings !st (Free (CutTx next)) =
 interpretTxAsync' !settings !st (Free (MoveOOBTx zipper mvmt next)) =
     do (zipper', res, TxAsyncDiskState cache' _ _ _) <- moveZipper (asyncDiskState settings st) (asyncCurSchema settings) mvmt zipper
        interpretTxAsync' settings (st { asyncDiskCache = cache' }) (next (zipper', res))
+interpretTxAsync' !settings !st (Free (LogActionTx act next)) =
+    do asyncLogAction settings act
+       interpretTxAsync' settings st next
 
 -- | The asynchronous interpreter is like the synchronous one, except it also keeps track of
 --   a copy of the disk cache. It uses that copy to quickly respond to read requests. When
@@ -436,8 +454,8 @@ interpretTxAsync' !settings !st (Free (MoveOOBTx zipper mvmt next)) =
 --   This means that this interpreter will also keep track of all zipper movements that take
 --   place. It then uses the TxnCommitLog TxnStep to send the log to the transaction coordinator
 --   where it will be replayed over the latest root, and an appropriate commit status returned.
-interpretTxAsync :: ZippySchema -> ShouldResync -> TxnStepsChan -> TxnId -> Tx a -> IO a
-interpretTxAsync sch shouldResync txnsChan txnId tx =
+interpretTxAsync :: ZippySchema -> ShouldResync -> TxnStepsChan -> (TxLogAction -> IO ()) -> TxnId -> Tx a -> IO a
+interpretTxAsync sch shouldResync txnsChan logFunc txnId tx =
     do curResult <- newEmptyMVar
        commitStatusResult <- newEmptyMVar
        diskResult <- newEmptyMVar
@@ -452,7 +470,9 @@ interpretTxAsync sch shouldResync txnsChan txnId tx =
                     , asyncCurSchema = sch
 
                     , asyncTxnsChan = txnsChan
-                    , asyncTxnId = txnId }
+                    , asyncTxnId = txnId
+
+                    , asyncLogAction = logFunc }
 
            st = TxAsyncInterpretState
                 { asyncDiskCache = diskCache
@@ -466,3 +486,24 @@ interpretTxAsync sch shouldResync txnsChan txnId tx =
                              takeMVar waitV
                              return ret
          DontResyncAfterTx -> return ret
+
+canonicalBuilderForZipper :: TxAsyncDiskState -> ZippySchema -> Zipper -> IO (Builder, TxAsyncDiskState)
+canonicalBuilderForZipper diskState _ (Zipper _ _ (InMemoryD (TextD x)) _) = pure (byteString (fromString (show x)), diskState)
+canonicalBuilderForZipper diskState  _ (Zipper _ _ (InMemoryD (IntegerD i)) _) = pure (int64Dec i, diskState)
+canonicalBuilderForZipper diskState _ (Zipper _ _ (InMemoryD (FloatingD f)) _) = pure (doubleDec f, diskState)
+canonicalBuilderForZipper diskState _ (Zipper _ _ (InMemoryD (BinaryD b)) _) = pure (byteString (fromString (show b)), diskState)
+canonicalBuilderForZipper diskState sch z@(Zipper _ (AlgebraicT (ZippyAlgebraicT _ cons)) (InMemoryD (CompositeD tag _)) _) =
+    do let ZippyTyCon (ZippyTyConName conName) argTys = cons V.! fromIntegral tag
+           parenthesized x = if V.length argTys > 0 then char8 '(' <> x <> char8 ')' else x
+
+           buildCanonicalArg (mkArgBuilders, diskState) (i, argTy) =
+               do (z', Moved argTy, diskState') <- moveZipper diskState sch (Down i) z
+                  (argBuilder, diskState'') <- canonicalBuilderForZipper diskState sch z'
+                  return ( mkArgBuilders . (argBuilder :), diskState'' )
+
+       (mkArgBuilders, diskState') <- foldlM buildCanonicalArg (id, diskState) (V.indexed argTys)
+       pure (parenthesized (TE.encodeUtf8Builder conName <> mconcat (map (char8 ' ' <>) (mkArgBuilders []))), diskState')
+canonicalBuilderForZipper _ _ _ = error "Cannot match type to data"
+
+emptyAsyncDiskState :: TxnStepsChan -> TxnId -> IO TxAsyncDiskState
+emptyAsyncDiskState txnsChan txnId = TxAsyncDiskState (emptyDiskCache 0) txnsChan txnId <$> newEmptyMVar

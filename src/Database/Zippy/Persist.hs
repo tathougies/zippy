@@ -111,7 +111,7 @@ readTextDUtf8 hdl = do txtSz <- alloca $ \retP -> do
                                   if bytesRead /= sizeOfP retP
                                     then fail "Could not read enough bytes for Int size for TextD"
                                     else peek retP
-                       utf8Encoded <- BS.hGet hdl (txtSz :: Int)
+                       utf8Encoded <- BS.hGet hdl (fromIntegral (txtSz :: Int32))
                        let decoded = TE.decodeUtf8 utf8Encoded
                        return (decoded `seq` InMemoryD (TextD decoded))
 
@@ -156,6 +156,7 @@ writeZippyDToDisk :: Handle -> InMemoryD -> IO ([(Word64, InMemoryD)], Word64)
 writeZippyDToDisk hdl mem =
     do start <- getCPUTime
        ret <- writeZippyDToDisk' hdl mem
+       hFlush hdl
        end <- getCPUTime
        modifyIORef' writeTime (+ (end - start))
        return ret

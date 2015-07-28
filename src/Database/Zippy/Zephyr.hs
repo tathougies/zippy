@@ -60,6 +60,8 @@ data GenericZephyrAtom quote sym =
   | LengthZ
 
   | FailZ
+  | LogZ
+  | YieldZ
 
   | EqZ
   | LtZ
@@ -168,6 +170,8 @@ mapQuote _ DipZ = DipZ
 mapQuote _ IfThenElseZ = IfThenElseZ
 mapQuote _ LengthZ = LengthZ
 mapQuote _ FailZ = FailZ
+mapQuote _ LogZ = LogZ
+mapQuote _ YieldZ = YieldZ
 mapQuote _ EqZ = EqZ
 mapQuote _ LtZ = LtZ
 mapQuote _ GtZ = GtZ
@@ -436,6 +440,15 @@ runZephyr (ZephyrProgram entry symbols) sch initialStk =
               case zephyrStack ctxt of
                 x:_ -> return (Left (HitFail (show x)))
                 _ -> return (Left (HitFail "Nothing on stack for FAIL"))
+          interpret YieldZ next ctxt =
+              case zephyrStack ctxt of
+                (ZephyrZ z):stk -> logAction (TxLogResult z) >>
+                                   go next (ctxt { zephyrStack = stk })
+                _ -> error "Cannot yield non-zipper"
+          interpret LogZ next ctxt =
+              case zephyrStack ctxt of
+                x:stk -> logAction (TxLogMessage (show x)) >>
+                         go next (ctxt { zephyrStack = stk })
           interpret EqZ next ctxt =
               arithmetic (\a b -> if a == b then zTrue else zFalse) next ctxt
           interpret LtZ next ctxt =
@@ -520,6 +533,8 @@ atomP = unquotedAtomP <|>
                             "CUT" -> pure CutZ
                             "IFTE"     -> pure IfThenElseZ
                             "FAIL"     -> pure FailZ
+                            "LOG"      -> pure LogZ
+                            "YIELD"    -> pure YieldZ
                             "LENGTH"   -> pure LengthZ
                             "=="       -> pure EqZ
                             ">"        -> pure GtZ

@@ -25,8 +25,10 @@ module Database.Zippy.Types
     , txnStepTxnId
 
     , move, moveOOB, cur, cut, childRef, curTy, parentArgHole, commit, abort
+    , logAction
 
     , TxnId(..), RunTxnStepFn(..), TxnStep(..)
+    , TxLogAction(..), simpleTxActionLogger, txResultActionLogger
     , TxState(..), ZippyState(..), zippyRootType
 
     , ZippyDiskState(..), ZippyDiskCache(..), emptyDiskCache
@@ -39,6 +41,7 @@ import Control.Concurrent.MVar
 import Control.Concurrent.Chan
 import Control.Concurrent.MVar
 import Control.DeepSeq
+import Control.Applicative
 
 import Data.ByteString (ByteString)
 import Data.Coerce
@@ -293,6 +296,8 @@ data TxF next = MoveTx !Movement (MoveResult -> next)
               | RebaseTx !RebaseFailureMode next
               | CommitTx (TxCommitStatus -> next)
               | AbortTx
+
+              | LogActionTx !TxLogAction next
                 deriving Functor
 type Tx = F TxF
 
@@ -342,6 +347,9 @@ rebase failMode = liftF (RebaseTx failMode ())
 abort :: Tx a
 abort = liftF AbortTx
 
+logAction :: TxLogAction -> Tx ()
+logAction act = liftF (LogActionTx act ())
+
 -- ** Multiple concurrent transactions
 
 newtype TxnId = TxnId Word32
@@ -374,6 +382,18 @@ txnStepTxnId (TxnStepCommitLog id _ _) = id
 txnStepTxnId (TxnStepDesynchronize id _) = id
 txnStepTxnId (TxnStepSynchronize id _ _ _) = id
 txnStepTxnId (TxnStepDesyncedRead id _ _ _) = id
+
+data TxLogAction = TxLogResult !Zipper
+                 | TxLogMessage !String
+                   deriving Show
+
+simpleTxActionLogger :: TxLogAction -> IO ()
+simpleTxActionLogger (TxLogMessage s) = putStrLn ("Zephyr: " ++ s)
+simpleTxActionLogger _ = putStrLn "Cannot log result in this transaction"
+
+txResultActionLogger :: Applicative m => Chan (m Zipper) -> TxLogAction -> IO ()
+txResultActionLogger _ (TxLogMessage s) = putStrLn ("Zephyr: " ++ s)
+txResultActionLogger zChan (TxLogResult z) = writeChan zChan (pure z)
 
 -- | Transaction state
 --
