@@ -34,7 +34,7 @@ module Database.Zippy.Types
 
     , ZippyDiskState(..), ZippyDiskCache(..), emptyDiskCache
 
-    , spineStrictMap
+    , spineStrictMapM
     ) where
 
 import Control.Monad.Free.Church
@@ -458,9 +458,8 @@ data ZippyDiskState = ZippyDiskState
 
                     , zippyDataCache  :: !ZippyDiskCache }
 
-spineStrictMap :: (a -> b) -> [a] -> [b]
-spineStrictMap f [] = []
-spineStrictMap f (x:xs) = let !x' = f x
-                              !xs' = spineStrictMap f xs
-                              !r = x':xs'
-                          in r
+spineStrictMapM :: Monad m => (a -> m b) -> [a] -> m [b]
+spineStrictMapM f [] = return []
+spineStrictMapM f (x:xs) = do !x' <- f x
+                              !xs' <- spineStrictMapM f xs
+                              return $! (x':xs')

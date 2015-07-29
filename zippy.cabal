@@ -19,7 +19,9 @@ library
   exposed-modules:     Database.Zippy.Types, Database.Zippy.Transaction, Database.Zippy.Persist,
                        Database.Zippy.Schema, Database.Zippy.Serve, Database.Zippy.Data, Database.Zippy.Disk,
                        Database.Zippy.Zephyr
-  other-modules:       Database.Zippy.Containers.Treap
+  other-modules:       Database.Zippy.Containers.Treap Database.Zippy.Zephyr.Types
+                       Database.Zippy.Zephyr.Eval Database.Zippy.Zephyr.Parse
+                       Database.Zippy.Zephyr.Compile
   default-extensions:  DataKinds, KindSignatures, GADTs, StandaloneDeriving, RoleAnnotations, DeriveFunctor, GeneralizedNewtypeDeriving, BangPatterns
   build-depends:       base >=4.7 && <4.8, text >=1.1 && <1.2, bytestring >=0.10 && <0.11, vector >=0.10 && <0.11, containers >=0.5, unordered-containers >= 0.2 && < 0.3,
                        free >= 4.12, hashable >= 1.2 && < 1.3, indents >= 0.3, parsec == 3.*, network-conduit >= 1.1, conduit >= 1.1, conduit-extra, hslogger, mtl >=2.2,
