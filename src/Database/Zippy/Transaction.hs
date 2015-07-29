@@ -75,14 +75,14 @@ recordDiskRefCheck !child !offs txnLog@(TransactionLog log)
     | otherwise = TransactionLog (log |> TxnCheckChildDiskRef child offs)
 
 
-conForTag :: Word16 -> ZippyAlgebraicT -> ZippyTyCon
+conForTag :: Word16 -> ZippyAlgebraicT -> ZippyDataCon
 conForTag tag (ZippyAlgebraicT _ cons) = cons V.! fromIntegral tag
 
-typeForConArg :: ZippySchema -> ZippyTyCon -> Int -> ZippyT
-typeForConArg schema (ZippyTyCon _ argTypes) forArg =
+typeForConArg :: ZippySchema -> ZippyDataCon -> Int -> ZippyT
+typeForConArg schema (ZippyDataCon _ argTypes) forArg =
     case zippyFieldType (argTypes V.! forArg) of
-      Right (ZippyTyRef tyRef) -> zippyTypes schema V.! tyRef
-      Left simple -> SimpleT simple
+      RefFieldT (ZippyTyRef tyRef) -> zippyTypes schema V.! tyRef
+      SimpleFieldT simple -> SimpleT simple
 
 class ZippyDiskStateLike diskState where
     readFromDiskState :: diskState -> ZippyT -> Word64 -> IO (InMemoryD, diskState)
@@ -493,7 +493,7 @@ canonicalBuilderForZipper diskState  _ (Zipper _ _ (InMemoryD (IntegerD i)) _) =
 canonicalBuilderForZipper diskState _ (Zipper _ _ (InMemoryD (FloatingD f)) _) = pure (doubleDec f, diskState)
 canonicalBuilderForZipper diskState _ (Zipper _ _ (InMemoryD (BinaryD b)) _) = pure (byteString (fromString (show b)), diskState)
 canonicalBuilderForZipper diskState sch z@(Zipper _ (AlgebraicT (ZippyAlgebraicT _ cons)) (InMemoryD (CompositeD tag _)) _) =
-    do let ZippyTyCon (ZippyTyConName conName) argTys = cons V.! fromIntegral tag
+    do let ZippyDataCon (ZippyDataConName conName) argTys = cons V.! fromIntegral tag
            parenthesized x = if V.length argTys > 0 then char8 '(' <> x <> char8 ')' else x
 
            buildCanonicalArg (mkArgBuilders, diskState) (i, argTy) =

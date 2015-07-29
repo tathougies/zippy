@@ -119,7 +119,7 @@ DATA ProductCategory ==
   CONS Music
 
 DATA PricingDetails ==
-  CONS PricingDetails (list : Floating) (savings : Floating)
+  CONS PricingDetails list=Floating savings=Floating
 
 DEFINE insert-product ==
   [ "dipped below prio" LOG

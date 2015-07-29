@@ -130,9 +130,9 @@ readBinaryD hdl = do binarySz <- alloca $ \retP -> do
                                      else peek retP
                      InMemoryD . BinaryD <$> BS.hGet hdl (binarySz :: Int)
 
-readArg :: Handle -> Either ZippySimpleT ZippyTyRef -> IO SZippyD
-readArg hdl (Left IntegerT) = eraseInMemoryD <$> readIntegerD hdl
-readArg hdl (Left FloatingT) = eraseInMemoryD <$> readFloatingD hdl
+readArg :: Handle -> ZippyFieldType ZippyTyRef -> IO SZippyD
+readArg hdl (SimpleFieldT IntegerT) = eraseInMemoryD <$> readIntegerD hdl
+readArg hdl (SimpleFieldT FloatingT) = eraseInMemoryD <$> readFloatingD hdl
 readArg hdl _ = alloca $ \retP -> do
                   bytesRead <- hGetBuf hdl retP (sizeOfP retP)
                   if bytesRead /= sizeOfP retP
@@ -148,7 +148,7 @@ readAlgebraicD hdl (ZippyAlgebraicT tyName cons) =
                    else peek retP :: IO Word16
        hSeek hdl RelativeSeek (fromIntegral (kATOM_SIZE - kTAG_SIZE))
        case cons V.!? fromIntegral tag of
-         Just (ZippyTyCon _ args) ->
+         Just (ZippyDataCon _ args) ->
              InMemoryD . CompositeD tag <$> mapM (readArg hdl . zippyFieldType) args
          Nothing -> fail (concat ["Received an invalid tag(", show tag, ") for composite type: ", show tyName])
 

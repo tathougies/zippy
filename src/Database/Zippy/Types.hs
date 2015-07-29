@@ -7,13 +7,14 @@ module Database.Zippy.Types
     , SZippyD(..), InMemoryD(..), InMemoryAtomD(..)
     , eraseInMemoryD
 
-    , ZippyTyName(..), ZippyTyConName(..), ZippyTyRef(..)
-    , GenericZippyTyCon(..), ZippyTyCon(..)
+    , ZippyTyName(..), ZippyDataConName(..), ZippyTyRef(..)
+    , GenericZippyTyCon(..), ZippyTyCon(..), GenericZippyTyCon(..)
     , GenericZippyField(..), ZippyField(..), zippyFieldType
-    , ZippyTyArgName(..)
+    , ZippyDataArgName(..), ZippyTyVarName(..)
+    , GenericZippyDataCon(..), ZippyDataCon(..), ZippyFieldType(..)
     , ZippySimpleT(..), ZippyAlgebraicT(..), GenericZippyAlgebraicT(..)
     , ZippyT(..), ZippySchema(..)
-    , zippySchemaRootType
+    , zippySchemaRootType, mapZippyAlgebraicT
 
     , Zipper(..), ZipperCursorInfo(..), ModificationState(..)
     , Context(..), Movement(..)
@@ -46,7 +47,7 @@ import Control.Applicative
 import Data.ByteString (ByteString)
 import Data.Coerce
 import Data.HashMap.Strict (HashMap)
-import Data.Hashable (Hashable)
+import Data.Hashable (Hashable(..), hashWithSalt)
 import Data.IORef
 import Data.Int
 import Data.Monoid
@@ -167,30 +168,42 @@ data ZippyTyName = ZippyTyName
                  { tyModule :: !Text
                  , tyName   :: !Text }
                    deriving (Show, Eq, Ord)
-newtype ZippyTyConName = ZippyTyConName Text
+data GenericZippyTyCon tyRef = ZippyTyCon !ZippyTyName !(Vector tyRef)
+                               deriving (Show, Eq, Ord, Functor)
+newtype ZippyTyVarName = ZippyTyVarName Text
+    deriving (Show, Eq, Ord, IsString, Hashable)
+newtype ZippyDataConName = ZippyDataConName Text
     deriving (Show, Eq, Ord, IsString)
 
 newtype ZippyTyRef = ZippyTyRef Int
     deriving (Show, Eq, Ord, Hashable)
-newtype ZippyTyArgName = ZippyTyArgName Text
+newtype ZippyDataArgName = ZippyDataArgName Text
     deriving (Show, Eq, Ord, IsString)
 
+data ZippyFieldType tyRef = SimpleFieldT !ZippySimpleT
+                          | RefFieldT    !tyRef
+                            deriving (Show, Eq, Ord, Functor)
+
+data ZippyScopedTyRef = LocalTyRef !ZippyTyRef
+                      | GlobalTyRef !ZippyTyRef
+                        deriving (Show, Eq, Ord)
+
 data GenericZippyField tyRef =
-    ZippyNamedField !ZippyTyArgName !(Either ZippySimpleT tyRef)
-  | ZippyUnnamedField !(Either ZippySimpleT tyRef)
+    ZippyNamedField !ZippyDataArgName !tyRef
+  | ZippyUnnamedField !tyRef
     deriving (Show, Eq, Ord, Functor)
 
-type ZippyField = GenericZippyField ZippyTyRef
+type ZippyField = GenericZippyField (ZippyFieldType ZippyTyRef)
 
-zippyFieldType :: GenericZippyField tyRef -> Either ZippySimpleT tyRef
+zippyFieldType :: GenericZippyField tyRef -> tyRef
 zippyFieldType (ZippyNamedField _ x) = x
 zippyFieldType (ZippyUnnamedField x) = x
 
-data GenericZippyTyCon tyRef =
-    ZippyTyCon !ZippyTyConName !(Vector (GenericZippyField tyRef))
+data GenericZippyDataCon tyRef =
+    ZippyDataCon !ZippyDataConName !(Vector (GenericZippyField tyRef))
     deriving (Show, Eq, Ord, Functor)
 
-type ZippyTyCon = GenericZippyTyCon ZippyTyRef
+type ZippyDataCon = GenericZippyDataCon (ZippyFieldType ZippyTyRef)
 
 data ZippySimpleT = IntegerT
                   | TextT
@@ -198,11 +211,12 @@ data ZippySimpleT = IntegerT
                   | BinaryT
                     deriving (Show, Eq, Ord)
 
-data GenericZippyAlgebraicT tyRef =
-    ZippyAlgebraicT !ZippyTyName !(Vector (GenericZippyTyCon tyRef))
+type ZippyTyCon = GenericZippyTyCon ZippyTyVarName
+data GenericZippyAlgebraicT tyVar tyRef =
+    ZippyAlgebraicT !(GenericZippyTyCon tyVar) !(Vector (GenericZippyDataCon tyRef))
     deriving (Show, Eq, Ord, Functor)
 
-type ZippyAlgebraicT = GenericZippyAlgebraicT ZippyTyRef
+type ZippyAlgebraicT = GenericZippyAlgebraicT (ZippyFieldType ZippyTyRef) (ZippyFieldType ZippyTyRef)
 
 data ZippyT = SimpleT !ZippySimpleT
             | AlgebraicT !ZippyAlgebraicT
@@ -216,6 +230,12 @@ data ZippySchema = ZippySchema
 zippySchemaRootType :: ZippySchema -> ZippyT
 zippySchemaRootType (ZippySchema { zippySchemaRoot = ZippyTyRef rootTyRef, zippyTypes = allTypes }) =
     allTypes V.! fromIntegral rootTyRef
+
+mapZippyAlgebraicT :: (a -> a') -> (b -> b') -> GenericZippyAlgebraicT a b -> GenericZippyAlgebraicT a' b'
+mapZippyAlgebraicT fa fb (ZippyAlgebraicT tyCon args) = ZippyAlgebraicT (fmap fa tyCon) (fmap (fmap fb) args)
+
+instance Hashable ZippyTyName where
+    hashWithSalt salt (ZippyTyName mod name) = hash mod `hashWithSalt` hash name `hashWithSalt` salt
 
 -- * The Zipper type
 

@@ -28,7 +28,7 @@ DEFINE int-compare ==
   ]
   IFTE
 
-TY switch
+
 DEFINE switch ==
   [ DUP null? ]
   [ "No cases matched" FAIL ]
@@ -87,4 +87,12 @@ DEFINE max ==
     > ]
   [ ZAP ]
   [ [ ZAP ] DIP ]
+  IFTE
+
+DEFINE replicate-n ==
+  [ [ DUP 0 == ] DIP SWAP ]
+  [ ZAP ZAP ]
+  [ [ -1 + ] DIP
+    DUP
+    [ SWAP [ I ] DIP ] DIP ]
   IFTE

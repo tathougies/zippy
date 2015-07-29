@@ -15,6 +15,7 @@ import Data.Text (Text)
 import Data.Traversable (mapM)
 import Data.Vector ((!))
 import Data.Vector (Vector, (!), findIndex)
+import Data.List (intercalate)
 
 import qualified Data.Vector as V
 import qualified Data.Text as T
@@ -36,21 +37,21 @@ parseZippyD' (SimpleT BinaryT) _ = fail "Can't parse BinaryT yet" -- InMemoryD .
 parseZippyD' (AlgebraicT (ZippyAlgebraicT tyName cons)) sch =
     parseAlgebraicD tyName cons sch
 
-parseAlgebraicD :: ZippyTyName -> Vector ZippyTyCon -> ZippySchema -> Parser InMemoryD
+parseAlgebraicD :: GenericZippyTyCon (ZippyFieldType ZippyTyRef) -> Vector (GenericZippyDataCon (ZippyFieldType ZippyTyRef)) -> ZippySchema -> Parser InMemoryD
 parseAlgebraicD tyName cons sch =
     do conName <- fromString <$> many1 (letter <|> digit)
        spaces
-       case findIndex (\(ZippyTyCon (ZippyTyConName name) _) -> name == conName) cons of
+       case findIndex (\(ZippyDataCon (ZippyDataConName name) _) -> name == conName) cons of
          Nothing -> fail ("Couldn't find constructor '" ++ T.unpack conName ++ "' for type " ++ show tyName)
-         Just tag -> do let ZippyTyCon _ args = cons ! tag
+         Just tag -> do let ZippyDataCon _ args = cons ! tag
                         argData <- mapM (\argTy -> parseArgD (zippyFieldType argTy) <* spaces) args
                         return (InMemoryD (CompositeD (fromIntegral tag) argData))
 
-    where parseArgD (Right (ZippyTyRef tyRef)) =
+    where parseArgD (RefFieldT (ZippyTyRef tyRef)) =
               let argTy = zippyTypes sch ! tyRef
               in between (char '(') (char ')') (eraseInMemoryD <$> parseZippyD' argTy sch)
-          parseArgD (Left TextT) = SZippyD . TextD <$> parseTextD
-          parseArgD (Left IntegerT) = SZippyD . IntegerD <$> parseIntegerD
+          parseArgD (SimpleFieldT TextT) = SZippyD . TextD <$> parseTextD
+          parseArgD (SimpleFieldT IntegerT) = SZippyD . IntegerD <$> parseIntegerD
 
 parseIntegerD :: Parser Int64
 parseIntegerD = int
@@ -152,6 +153,9 @@ parseTextD = fromString <$> (stringLiteral <* spaces)
                              '\BEL','\DLE','\DC1','\DC2','\DC3','\DC4','\NAK',
                              '\SYN','\ETB','\CAN','\SUB','\ESC','\DEL']
 
+reifyFieldType _ (SimpleFieldT s) = SimpleT s
+reifyFieldType types (RefFieldT (ZippyTyRef i)) = types ! i
+
 defaultForSchema :: ZippySchema -> InMemoryD
 defaultForSchema (ZippySchema (ZippyTyRef rootTypeIndex) types) = defaultForType (types ! rootTypeIndex)
     where defaultForType (SimpleT IntegerT) = InMemoryD (IntegerD 0)
@@ -159,8 +163,8 @@ defaultForSchema (ZippySchema (ZippyTyRef rootTypeIndex) types) = defaultForType
           defaultForType (SimpleT TextT) = InMemoryD (TextD "")
           defaultForType (SimpleT BinaryT) = InMemoryD (BinaryD "")
           defaultForType (AlgebraicT (ZippyAlgebraicT _ cons)) =
-              let ZippyTyCon _ argTys = cons ! 0
-                  realArgTys = fmap (either SimpleT (\(ZippyTyRef i) -> types ! i) . zippyFieldType) argTys
+              let ZippyDataCon _ argTys = cons ! 0
+                  realArgTys = fmap (reifyFieldType types . zippyFieldType) argTys
               in InMemoryD (CompositeD 0 (fmap (eraseInMemoryD . defaultForType) realArgTys))
 
 showZippyD :: ZippySchema -> SZippyD -> String
@@ -171,12 +175,17 @@ showZippyD (ZippySchema (ZippyTyRef rootTypeIndex) types) = showZippyD' (types !
           showZippyD' _ (SZippyD (TextD t)) = show (T.unpack t)
           showZippyD' _ (SZippyD (BinaryD bin)) = 'b':show (BS.unpack bin)
           showZippyD' (AlgebraicT (ZippyAlgebraicT tyName cons)) (SZippyD (CompositeD tag args)) =
-              let ZippyTyCon (ZippyTyConName conName) argTys = cons ! fromIntegral tag
-                  realArgTys = map (either SimpleT (\(ZippyTyRef i) -> types ! i) . zippyFieldType) (V.toList argTys)
+              let ZippyDataCon (ZippyDataConName conName) argTys = cons ! fromIntegral tag
+                  realArgTys = map (reifyFieldType types . zippyFieldType) (V.toList argTys)
               in concat ["(", T.unpack conName, concatMap (' ':) $ zipWith showZippyD' realArgTys (V.toList args), ")"]
           showZippyD' _ _ = error "Expecting algebraic type, but got atom"
 
-          prettyTyName (AlgebraicT (ZippyAlgebraicT (ZippyTyName pkgName dataName) _)) = T.unpack pkgName ++ ":" ++ T.unpack dataName
+          prettyFieldTyName (SimpleFieldT s) = prettyTyName (SimpleT s)
+          prettyFieldTyName (RefFieldT (ZippyTyRef i)) = prettyTyName (types ! i)
+
+          prettyTyName (AlgebraicT (ZippyAlgebraicT (ZippyTyCon (ZippyTyName pkgName dataName) tyArgs) _))
+              | V.null tyArgs = T.unpack pkgName ++ ":" ++ T.unpack dataName
+              | otherwise = "(" ++ T.unpack pkgName ++ ":" ++ T.unpack dataName ++ " " ++ intercalate " " (map prettyFieldTyName (V.toList tyArgs))
           prettyTyName (SimpleT IntegerT) = "atom:Integer"
           prettyTyName (SimpleT TextT) = "atom:Text"
           prettyTyName (SimpleT FloatingT) = "atom:Floating"

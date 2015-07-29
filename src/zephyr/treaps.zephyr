@@ -1,12 +1,12 @@
 PACKAGE treaps
 
-DATA Treap ==
+DATA Treap k v ==
   CONS Leaf
-  CONS Branch key=Integer value=Text prio=Integer left=Treap right=Treap
+  CONS Branch key=k value=v prio=Integer left=(Treap k v) right=(Treap k v)
 {  DEFAULT Leaf}
 
 DATA TreapsDatabase ==
-  CONS TreapsDatabase Treap
+  CONS TreapsDatabase (Treap Integer Text)
 
 DEFINE treap-find-with-level ==
   { We expect two arguments on the stack.
