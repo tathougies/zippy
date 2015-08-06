@@ -1,4 +1,5 @@
 {-# OPTIONS_GHC -funbox-strict-fields #-}
+{-# LANGUAGE DeriveTraversable, DeriveFoldable #-}
 module Database.Zippy.Types
     ( ZippyStorage(..), ZippyDataType(..)
 
@@ -58,6 +59,8 @@ import Data.Vector (Vector)
 import Data.Word
 import Data.Time.Clock.POSIX
 import Data.HashPSQ (HashPSQ)
+import Data.Traversable (Traversable)
+import Data.Foldable (Foldable)
 
 import qualified Data.HashPSQ as PSQ
 import qualified Data.ByteString as BS
@@ -169,7 +172,7 @@ data ZippyTyName = ZippyTyName
                  , tyName   :: !Text }
                    deriving (Show, Eq, Ord)
 data GenericZippyTyCon tyRef = ZippyTyCon !ZippyTyName !(Vector tyRef)
-                               deriving (Show, Eq, Ord, Functor)
+                               deriving (Show, Eq, Ord, Functor, Traversable, Foldable)
 newtype ZippyTyVarName = ZippyTyVarName Text
     deriving (Show, Eq, Ord, IsString, Hashable)
 newtype ZippyDataConName = ZippyDataConName Text
@@ -182,7 +185,7 @@ newtype ZippyDataArgName = ZippyDataArgName Text
 
 data ZippyFieldType tyRef = SimpleFieldT !ZippySimpleT
                           | RefFieldT    !tyRef
-                            deriving (Show, Eq, Ord, Functor)
+                            deriving (Show, Eq, Ord, Functor, Traversable, Foldable)
 
 data ZippyScopedTyRef = LocalTyRef !ZippyTyRef
                       | GlobalTyRef !ZippyTyRef

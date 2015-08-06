@@ -280,7 +280,7 @@ serveZippy (ZippyServeSettings { .. }) =
                           return ret
 
        zephyrPackages <- loadZephyrPackages zephyrPackageDirectory
-       let (exports, schema) = compilePackages zephyrPackages zephyrRootTyName
+       let (exports, schema) = compilePackages zephyrPackages (ZippyTyCon zephyrRootTyName mempty)
 
        infoM "serveZippy" ("Loaded packages " ++ show (map zephyrPackageName zephyrPackages))
 

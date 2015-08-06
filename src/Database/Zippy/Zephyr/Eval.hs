@@ -1,6 +1,7 @@
 {-# OPTIONS_GHC -fwarn-incomplete-patterns #-}
 {-# LANGUAGE OverloadedStrings #-}
-module Database.Zippy.Zephyr.Eval where
+module Database.Zippy.Zephyr.Eval
+       ( runZephyr, zephyrCtxtWithStack ) where
 
 import Database.Zippy.Types
 import Database.Zippy.Zephyr.Types
@@ -117,6 +118,7 @@ runZephyr (ZephyrProgram entry symbols) sch initialStk =
                                  TextZ t -> ZephyrD (TextD t)
                                  x -> ZephyrQ (V.singleton x)
                     in go next (ctxt { zephyrStack = head:(ZephyrQ (V.tail qXs)):stk })
+                _ -> return (Left UnConsZExpectsQuote)
           interpret DeQuoteZ next ctxt =
               case zephyrStack ctxt of
                 (ZephyrQ next'):xs ->
@@ -184,13 +186,13 @@ runZephyr (ZephyrProgram entry symbols) sch initialStk =
           interpret CutZ next ctxt =
               do z <- cut
                  go next (zephyrPush (ZephyrZ z) ctxt)
-          interpret (CheckTagZ tag) next ctxt =
-              case zephyrStack ctxt of
-                (ZephyrZ (Zipper _ _ (InMemoryD (CompositeD actTag _)) _):stk) ->
-                    let res = if tag == actTag
-                              then zTrue
-                              else zFalse
-                    in go next (ctxt { zephyrStack = res:stk })
+          -- interpret (CheckTagZ tag) next ctxt =
+          --     case zephyrStack ctxt of
+          --       (ZephyrZ (Zipper _ _ (InMemoryD (CompositeD actTag _)) _):stk) ->
+          --           let res = if tag == actTag
+          --                     then zTrue
+          --                     else zFalse
+          --           in go next (ctxt { zephyrStack = res:stk })
           interpret IfThenElseZ next ctxt =
               case zephyrStack ctxt of
                 (ZephyrQ else_):(ZephyrQ then_):(ZephyrQ if_):stk ->
@@ -229,8 +231,6 @@ runZephyr (ZephyrProgram entry symbols) sch initialStk =
                    Right zippyArgs ->
                        go next (zephyrPush (ZephyrZ (Zipper OnlyInMemory (zippyTypes sch V.! tyRef) (InMemoryD (CompositeD tag (V.fromList zippyArgs))) [])) ctxt)
                    Left err -> return (Left err)
-
---          interpret x next ctxt = fail ("can't interpret " ++ show x)
 
           arithmetic :: (Int64 -> Int64 -> ZephyrD) -> Vector CompiledZephyrAtom -> ZephyrContext -> Tx (Either ZephyrEvalError ZephyrContext)
           arithmetic f next ctxt =

@@ -1,8 +1,12 @@
 {-# LANGUAGE TupleSections, OverloadedStrings #-}
 module Database.Zippy.Zephyr.Compile where
 
+import Prelude hiding (foldl)
+
 import Database.Zippy.Types
 import Database.Zippy.Zephyr.Types
+import Database.Zippy.Zephyr.TyCheck
+import Database.Zippy.Zephyr.Internal
 
 import Control.Arrow
 import Control.Applicative
@@ -10,171 +14,166 @@ import Control.Monad.State
 
 import Data.Maybe
 import Data.Monoid
+import Data.Int
+import Data.Foldable (foldl)
 import qualified Data.HashMap.Strict as HM
 import qualified Data.Map as M
 import qualified Data.Vector as V
 import qualified Data.Text as T
 import qualified Data.Set as S
-import qualified Data.DList as D
 
-genDefinitionsForType :: ZippyTyRef -> GenericZippyAlgebraicT ZippyTyVarName ZephyrScopedTy -> [ZephyrSymbolDefinition]
-genDefinitionsForType tyRef (ZippyAlgebraicT tyName cons) = concatMap genDefinitionsForCon (zip [0..] (V.toList cons))
-    where genDefinitionsForCon (conIndex, ZippyDataCon (ZippyDataConName conName) argTys) =
-              [ ZephyrSymbolDefinition (ZephyrWord ("IS-" <> conName <> "?"))
-                ( ZephyrBuilder . D.fromList $
-                  [ CheckTagZ (fromIntegral conIndex) ] )
+import Debug.Trace
 
-              , ZephyrSymbolDefinition (ZephyrWord ("CUR-IS-" <> conName <> "?"))
-                ( ZephyrBuilder . D.fromList $
-                  [ CurTagZ
-                  , IntegerZ (fromIntegral conIndex)
-                  , EqZ ] )
+boolAtomTy = StackAtomZipper (ZipperConcrete (RefFieldT (ZippyTyCon (ZippyTyName "base" "Bool") mempty)))
+scopedTyToZipper (Local var) = ZipperVar var
+scopedTyToZipper (Global (SimpleFieldT s)) = ZipperConcrete (SimpleFieldT s)
+scopedTyToZipper (Global (RefFieldT r)) = ZipperConcrete (RefFieldT (fmap scopedTyToZipper r))
 
-              , ZephyrSymbolDefinition (ZephyrWord conName)
-                ( ZephyrBuilder . D.fromList $
-                  [ TagZ tyRef (fromIntegral conIndex) (V.length argTys) ] ) ] ++
+genDefinitionsForType :: ZippyTyRef -> GenericZippyAlgebraicT ZippyTyVarName ZephyrScopedTy -> [(ZephyrEffect ZippyTyVarName, GenericZephyrSymbolDefinition ZephyrTyChecked)]
+genDefinitionsForType tyRef (ZippyAlgebraicT tyCon cons) = concatMap genDefinitionsForCon (zip [0..] (V.toList cons))
+    where tyConZ = ZipperConcrete (RefFieldT (fmap ZipperVar tyCon))
+
+          genDefinitionsForCon :: (Int, GenericZippyDataCon ZephyrScopedTy) -> [(ZephyrEffect ZippyTyVarName, GenericZephyrSymbolDefinition ZephyrTyChecked)]
+          genDefinitionsForCon (conIndex, ZippyDataCon (ZippyDataConName conName) argTys) =
+              [ ( ZephyrEffect (ZipperVar "$z") (StackVar "$s" :> StackAtomZipper tyConZ) (StackVar "$s" :> boolAtomTy)
+                , ZephyrSymbolDefinition (ZephyrWord ("IS-" <> conName <> "?"))
+                  ( ZephyrTyChecked $
+                    [ QuoteZ (ZephyrTyChecked $
+                              [ CurTagZ
+                              , IntegerZ (fromIntegral conIndex)
+                              , EqZ ])
+                    , EnterZipperZ
+                    , SwapZ ] ))
+
+              , ( ZephyrEffect tyConZ (StackVar "$s") (StackVar "$s" :> boolAtomTy)
+                , ZephyrSymbolDefinition (ZephyrWord ("CUR-IS-" <> conName <> "?"))
+                  ( ZephyrTyChecked $
+                    [ CurTagZ
+                    , IntegerZ (fromIntegral conIndex)
+                    , EqZ ] ) )
+
+              , ( ZephyrEffect (ZipperVar "$z") (StackVar "$s") (StackVar "$s" :> StackAtomZipper tyConZ)
+                , ZephyrSymbolDefinition (ZephyrWord conName)
+                  ( ZephyrTyChecked $
+                    [ TagZ tyRef (fromIntegral conIndex) (V.length argTys) ] ) ) ] ++
               concatMap genDefinitionsForArg (zip [0..] (V.toList argTys))
 
+          genDefinitionsForArg :: (Int64, GenericZippyField ZephyrScopedTy) -> [(ZephyrEffect ZippyTyVarName, GenericZephyrSymbolDefinition ZephyrTyChecked)]
           genDefinitionsForArg (i, ZippyUnnamedField _) = []
-          genDefinitionsForArg (i, ZippyNamedField (ZippyDataArgName argName) _) =
-              [ ZephyrSymbolDefinition (ZephyrWord ("VISIT-" <> argName))
-                ( ZephyrBuilder . D.fromList $
-                  [ IntegerZ i
-                  , ZipDownZ
+          genDefinitionsForArg (i, ZippyNamedField (ZippyDataArgName argName) fieldTy) =
+              [ ( ZephyrEffect tyConZ (StackVar "$s" :> StackAtomQuote (ZephyrEffect (scopedTyToZipper fieldTy) (StackVar "$s") (StackVar "$s'"))) (StackVar "$s'")
+                , ZephyrSymbolDefinition (ZephyrWord ("VISIT-" <> argName))
+                  ( ZephyrTyChecked $
+                    [ IntegerZ i
+                    , ZipDownZ
 
-                  , DeQuoteZ
+                    , DeQuoteZ
 
-                  , ZipUpZ ])
+                    , ZipUpZ ]) )
 
-              , ZephyrSymbolDefinition (ZephyrWord ("MOVETO-" <> argName))
-                ( ZephyrBuilder . D.fromList $
-                  [ IntegerZ i, ZipDownZ ])
+              , ( ZephyrEffect tyConZ (StackVar "$s") (StackVar "$s" :> boolAtomTy)
+                , ZephyrSymbolDefinition (ZephyrWord ("CHK-HOLE-" <> argName))
+                  ( ZephyrTyChecked $
+                    [ ArgHoleZ
+                    , IntegerZ i
+                    , EqZ ] ) ) ]
 
-              , ZephyrSymbolDefinition (ZephyrWord ("CHK-HOLE-" <> argName))
-                ( ZephyrBuilder . D.fromList $
-                  [ ArgHoleZ
-                  , IntegerZ i
-                  , EqZ ] ) ]
+instantiateAllTypes :: ZephyrTypeLookupEnv -> ZephyrTypeInstantiationEnv -> [GenericZippyAlgebraicT ZippyTyVarName ZephyrScopedTy] -> ZephyrTypeInstantiationEnv
+instantiateAllTypes allTypes env types = foldl instantiateType env types
+    where instantiateType env ty@(ZippyAlgebraicT (ZippyTyCon tyName args) cons)
+              | V.null args = let env' = snd (internType allTypes env (ZephyrInstantiatedType (ZippyTyCon tyName mempty)))
+                                  env'' = foldl (instantiateTypesFromCon HM.empty) env' cons
+                              in env''
+              | otherwise = env
 
-collectInstantiatedTypes :: [GenericZippyAlgebraicT ZippyTyVarName ZephyrScopedTy] -> [GenericZippyAlgebraicT (ZippyFieldType RecZippyTyCon) (ZippyFieldType RecZippyTyCon)]
-collectInstantiatedTypes zephyrTypes = S.toList (execState collectTypes S.empty)
-    where collectTypes :: State (S.Set (GenericZippyAlgebraicT (ZippyFieldType RecZippyTyCon) (ZippyFieldType RecZippyTyCon))) ()
-          collectTypes = mapM_ collectType zephyrTypes
+          instantiateTypesFromCon tyVars env (ZippyDataCon conName args) =
+              foldl (instantiateTypesForArg tyVars) env (fmap zippyFieldType args)
 
-          collectType :: GenericZippyAlgebraicT ZippyTyVarName ZephyrScopedTy -> State (S.Set (GenericZippyAlgebraicT (ZippyFieldType RecZippyTyCon) (ZippyFieldType RecZippyTyCon))) ()
-          collectType ty@(ZippyAlgebraicT (ZippyTyCon tyName args) cons)
-              | V.null args = collectType' HM.empty ty
-              | otherwise = return ()
+          instantiateTypesForArg tyVars env (Local var) =
+              case HM.lookup var tyVars of
+                Nothing -> error "Encountered unbound type variable in type"
+                Just ty -> env
+          instantiateTypesForArg tyVars env (Global (SimpleFieldT _)) = env
+          instantiateTypesForArg tyVars env (Global (RefFieldT r)) =
+              instantiate env tyVars r
 
-          collectType' :: HM.HashMap ZippyTyVarName (ZippyFieldType RecZippyTyCon) -> GenericZippyAlgebraicT ZippyTyVarName ZephyrScopedTy -> State (S.Set (GenericZippyAlgebraicT (ZippyFieldType RecZippyTyCon) (ZippyFieldType RecZippyTyCon))) ()
-          collectType' locals ty@(ZippyAlgebraicT (ZippyTyCon tyName args) cons) =
-              do let instantiatedTy = ZippyAlgebraicT (ZippyTyCon tyName (fmap resolveVar args)) instantiatedCons
-                     instantiatedCons = fmap (fmap resolveScoped) cons
+          instantiate env tyVars (ZippyTyCon tyName tyArgs) =
+              -- First we intern the fully instantiated type to prevent cycles...
+              let instantiatedType =  ZephyrInstantiatedType $ ZippyTyCon tyName args'
+                  args' = fmap (resolveTyVars tyVars) tyArgs
+              -- Then we lookup the type by name, so that we can recursively instantiate types we find in its constructors
+              in if alreadyInstantiatedInEnv instantiatedType allTypes env
+                 then env
+                 else let env' = snd (internType allTypes env instantiatedType)
+                      in case lookupInTyEnv tyName allTypes of
+                           Nothing -> error ("Cannot find type " ++ show tyName)
+                           Just (ZippyAlgebraicT (ZippyTyCon _ expArgs) cons)
+                               | V.length expArgs == V.length tyArgs ->
+                                   let tyVars' = HM.fromList $
+                                                 zip (V.toList expArgs) (V.toList args')
+                                   in foldl (instantiateTypesFromCon tyVars') env' cons
+                               | otherwise -> error ("Type constructor arity mismatch: " ++ show tyName)
 
-                     resolveVar varName = case HM.lookup varName locals of
-                                            Nothing -> error ("cannot find type for " ++ show varName)
-                                            Just x -> x
-                     resolveScoped (Local varName) = resolveVar varName
-                     resolveScoped (Global (SimpleFieldT s)) = SimpleFieldT s
-                     resolveScoped (Global (RefFieldT (ZippyTyCon tyName args))) = RefFieldT (RecZippyTyCon (ZippyTyCon tyName (fmap resolveScoped args)))
-                 modify (S.insert instantiatedTy)
-                 V.mapM_ instantiateConstructorArgs instantiatedCons
-
-          instantiateConstructorArgs :: GenericZippyDataCon (ZippyFieldType RecZippyTyCon) -> State (S.Set (GenericZippyAlgebraicT (ZippyFieldType RecZippyTyCon) (ZippyFieldType RecZippyTyCon))) ()
-          instantiateConstructorArgs (ZippyDataCon conName args) = V.mapM_ (withFieldType instantiateConstructorArg) args
-
-          withFieldType f (ZippyNamedField name x) = ZippyNamedField name <$> f x
-          withFieldType f (ZippyUnnamedField x) = ZippyUnnamedField <$> f x
-
-          instantiateConstructorArg :: ZippyFieldType RecZippyTyCon -> State (S.Set (GenericZippyAlgebraicT (ZippyFieldType RecZippyTyCon) (ZippyFieldType RecZippyTyCon))) ()
-          instantiateConstructorArg (SimpleFieldT _) = return ()
-          instantiateConstructorArg (RefFieldT (RecZippyTyCon (ZippyTyCon qTyName tyArgs))) =
-              do case HM.lookup (tyName qTyName) allTypes of
-                   Nothing -> fail ("Cannot find type " ++ show qTyName)
-                   Just ty@(ZippyAlgebraicT (ZippyTyCon argTyName argNames) cons) ->
-                       do let cons' = fmap (fmap (resolveTyVars locals)) cons
-                              newType = ZippyAlgebraicT (ZippyTyCon argTyName tyArgs) cons'
-                              locals = HM.fromList (V.toList (V.zip argNames tyArgs))
-                          typesInstantiated <- get
-                          if V.length argNames == V.length tyArgs
-                             then if newType `S.member` typesInstantiated then return () else collectType' locals ty
-                             else fail "Arity mismatch in type constructor"
-
-                 return ()
-
-          resolveTyVars :: HM.HashMap ZippyTyVarName (ZippyFieldType RecZippyTyCon) -> ZephyrScopedTy -> ZippyFieldType RecZippyTyCon
-          resolveTyVars locals (Local name) =
-              case HM.lookup name locals of
-                Nothing -> error ("No such type variable: " ++ show name)
+          resolveTyVars tyVars (Local var) =
+              case HM.lookup var tyVars of
+                Nothing -> error "Encountered unbound type variable in type"
                 Just x -> x
-          resolveTyVars _ (Global (SimpleFieldT i)) = SimpleFieldT i
-          resolveTyVars locals (Global (RefFieldT tyCon)) =
-              let ZippyTyCon tyName tyArgs = tyCon
-              in RefFieldT (RecZippyTyCon (ZippyTyCon tyName (fmap (resolveTyVars locals) tyArgs)))
+          resolveTyVars tyVars (Global (SimpleFieldT s)) = SimpleFieldT s
+          resolveTyVars tyVars (Global (RefFieldT (ZippyTyCon tyName tyArgs))) = RefFieldT (ZephyrInstantiatedType (ZippyTyCon tyName (fmap (resolveTyVars tyVars) tyArgs)))
 
-          allTypes = HM.fromList $
-                     map (\ty@(ZippyAlgebraicT (ZippyTyCon qTyName _) _) -> (tyName qTyName, ty)) zephyrTypes
+compilePackages :: [ZephyrPackage] -> ZippyTyCon -> (HM.HashMap ZephyrWord ZephyrProgram, ZippySchema)
+compilePackages pkgs rootTy =
+    let allTypes = tyEnvFromList allTypesList
+        allTypesList = map (qualifyConArgTypes allTypes) (concatMap zephyrTypes pkgs)
 
-compilePackages :: [ZephyrPackage] -> ZippyTyName -> (HM.HashMap ZephyrWord ZephyrProgram, ZippySchema)
-compilePackages pkgs rootTyName =
-    let namesToInts = HM.fromList (zip names [0..])
-        qualifiedSymbols = mconcat (map (\pkg -> map (zephyrPackageName pkg,) (zephyrSymbols pkg ++ concatMap genDefinitionsForType' (zephyrTypes pkg))) pkgs)
-        symbols = map snd qualifiedSymbols
-        names = map zephyrSymbolName symbols
+        definitions = concatMap (\ty@(ZippyAlgebraicT (ZippyTyCon (ZippyTyName pkg _) _) _) -> map (pkg,) $
+                                                                                               genDefinitionsForType (ZippyTyRef 0) ty) allTypesList
 
-        resolveSymbol symbol = fromJust (HM.lookup symbol namesToInts <|> error ("Cannot find " ++ show symbol))
+        tyInstantiationEnv = foldl (\env pkg -> instantiateAllTypes allTypes env (zephyrTypes pkg)) emptyZephyrTypeInstantiationEnv pkgs
+        tyChecked = trace ("Got definitions " ++ show definitions) $
+                    runInNewTyCheckM $ do
+                      pretypedSymbols <- buildSymbolEnv <$>
+                                         mapM (\(pkgName, (ty, ZephyrSymbolDefinition symName _)) -> ((ZephyrWord pkgName, symName),) <$> instantiate (ZephyrEffectWithNamedVars ty)) definitions
+                      tyCheckPackages pretypedSymbols allTypes pkgs
+    in trace ("Type checked " ++ show tyChecked ++ ". With types " ++ show tyInstantiationEnv) undefined
 
-        compiled = map compiledSymbol symbols
-        compiledSymbol (ZephyrSymbolDefinition _ builder) = compiledBuilder builder
-        compiledBuilder (ZephyrBuilder d) =
-            let shallowResolved = map (fmap resolveSymbol) (D.toList d)
-                resolved = map (mapQuote compiledBuilder) shallowResolved
-            in CompiledZephyr . V.fromList $ resolved
 
-        qualifiedWords = map (uncurry ZephyrQualifiedWord . second zephyrSymbolName ) qualifiedSymbols
+    --     namesToInts = HM.fromList (zip names [0..])
+    --     qualifiedSymbols = mconcat (map (\pkg -> map (zephyrPackageName pkg,) (zephyrSymbols pkg ++ concatMap genDefinitionsForType' (zephyrTypes pkg))) pkgs)
+    --     symbols = map snd qualifiedSymbols
+    --     names = map zephyrSymbolName symbols
 
-        qualifyType (ZippyAlgebraicT tyName cons) =
-            ZippyAlgebraicT tyName (fmap (fmap qualifyScoped) cons)
-        qualifyScoped (Local name) = Local name
-        qualifyScoped (Global (SimpleFieldT s)) = Global (SimpleFieldT s)
-        qualifyScoped (Global (RefFieldT (ZippyTyCon tyName args))) =
-            Global (RefFieldT (ZippyTyCon (qualifyTyName tyName) (fmap qualifyScoped args) ))
-        qualifyTyName tyName@(ZippyTyName pkg name)
-            | T.null pkg = case HM.lookup name unqualifiedTypes of
-                             Nothing -> error ("No package mentions the type " ++ show name)
-                             Just (Unambiguous pkg)  -> ZippyTyName pkg name
-                             Just (Ambiguous   pkgs) -> error ("The type " ++ show name ++ " is ambiguous. It is declared in " ++ show pkgs ++ ". Qualify the type using <pkg>:<name> syntax")
-            | otherwise = tyName
+    --     resolveSymbol symbol = fromJust (HM.lookup symbol namesToInts <|> error ("Cannot find " ++ show symbol))
 
-        unqualifiedTypes = foldl insertQualifiedType HM.empty allTypes
-        insertQualifiedType typeMap (ZippyAlgebraicT (ZippyTyCon (ZippyTyName pkg name) _) _) =
-            case HM.lookup name typeMap of
-              Nothing -> HM.insert name (Unambiguous pkg) typeMap
-              Just (Ambiguous pkgs) -> HM.insert name (Ambiguous (pkg:pkgs)) typeMap
-              Just (Unambiguous pkg') -> HM.insert name (Ambiguous [pkg, pkg']) typeMap
+    --     compiled = map compiledSymbol symbols
+    --     compiledSymbol (ZephyrSymbolDefinition _ builder) = compiledBuilder builder
+    --     compiledBuilder (ZephyrTyChecked d) =
+    --         let shallowResolved = map (fmap resolveSymbol) d
+    --             resolved = map (mapQuote compiledBuilder) shallowResolved
+    --         in CompiledZephyr . V.fromList $ resolved
 
-        allTypes = concatMap zephyrTypes pkgs
-        allQualifiedTypes = fmap qualifyType allTypes
-        allInstantiatedTypes = collectInstantiatedTypes allQualifiedTypes
-        tyToTyRef :: M.Map (GenericZippyTyCon (ZippyFieldType RecZippyTyCon)) ZippyTyRef
-        tyToTyRef = M.fromList $
-                    zip (map (\(ZippyAlgebraicT qTy _) -> qTy) allInstantiatedTypes) (map ZippyTyRef [0..])
+    --     qualifiedWords = map (uncurry ZephyrQualifiedWord . second zephyrSymbolName ) qualifiedSymbols
 
-        Just rootTy = M.lookup (ZippyTyCon (qualifyTyName rootTyName) V.empty) tyToTyRef
-        schema = let lookupFieldTy (SimpleFieldT s) = SimpleFieldT s
-                     lookupFieldTy (RefFieldT ty) =
-                         case M.lookup (unRecTy ty) tyToTyRef of
-                           Just x -> RefFieldT x
-                           Nothing -> error ("Could not find instantiation of " ++ show ty)
-                 in ZippySchema rootTy (V.fromList (map (AlgebraicT . mapZippyAlgebraicT lookupFieldTy lookupFieldTy) allInstantiatedTypes))
+    --     allInstantiatedTypes = collectInstantiatedTypes allTypes
+    --     tyToTyRef :: M.Map (GenericZippyTyCon (ZippyFieldType RecZippyTyCon)) ZippyTyRef
+    --     tyToTyRef = M.fromList $
+    --                 zip (map (\(ZippyAlgebraicT qTy _) -> qTy) allInstantiatedTypes) (map ZippyTyRef [0..])
 
-        genDefinitionsForType' ty@(ZippyAlgebraicT qTy _) =
-            --let Just tyRef = HM.lookup qTy tyToTyRef
-            {-in-} genDefinitionsForType (ZippyTyRef 0) {- TODO How do we figure out the type reference if we don't know what the types are until run-time? -} ty
+    --     Just rootTy = M.lookup (ZippyTyCon (qualifyTy rootTyName allTypes) V.empty) tyToTyRef
+    --     schema = let lookupFieldTy (SimpleFieldT s) = SimpleFieldT s
+    --                  lookupFieldTy (RefFieldT ty) =
+    --                      case M.lookup (unRecTy ty) tyToTyRef of
+    --                        Just x -> RefFieldT x
+    --                        Nothing -> error ("Could not find instantiation of " ++ show ty)
+    --              in ZippySchema rootTy (V.fromList (map (AlgebraicT . mapZippyAlgebraicT lookupFieldTy lookupFieldTy) allInstantiatedTypes))
 
-        allExports = concatMap zephyrExports pkgs
-        progs = HM.fromList $
-                map (\export -> (export, ZephyrProgram (fromJust (HM.lookup export namesToInts)) symbolTbl)) allExports
+    --     genDefinitionsForType' ty@(ZippyAlgebraicT qTy _) =
+    --         --let Just tyRef = HM.lookup qTy tyToTyRef
+    --         {-in-} genDefinitionsForType (ZippyTyRef 0) {- TODO How do we figure out the type reference if we don't know what the types are until run-time? -} ty
 
-        symbolTbl = V.fromList (zipWith CompiledZephyrSymbol qualifiedWords compiled)
-    in (progs, schema)
+    --     allExports = concatMap zephyrExports pkgs
+    --     progs = HM.fromList $
+    --             map (\export -> (export, ZephyrProgram (fromJust (HM.lookup export namesToInts)) symbolTbl)) allExports
+
+    --     symbolTbl = V.fromList (zipWith CompiledZephyrSymbol qualifiedWords compiled)
+    -- in (progs, schema)

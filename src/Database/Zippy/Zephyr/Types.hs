@@ -1,17 +1,27 @@
+{-# LANGUAGE DeriveFunctor, DeriveTraversable, DeriveFoldable #-}
 module Database.Zippy.Zephyr.Types where
 
 import Database.Zippy.Types
+
+import Prelude hiding (mapM)
+
+import Control.Monad.Writer hiding (mapM)
 
 import Data.Int
 import Data.String
 import Data.Hashable
 import Data.Word
 import Data.Monoid
+import Data.Traversable (Traversable, mapM)
+import Data.Foldable (Foldable)
 import Data.Vector (Vector)
 import Data.DList (DList)
 import Data.Text (Text)
 import Data.ByteString (ByteString)
 import qualified Data.HashMap.Strict as HM
+import qualified Data.Set as S
+
+import Text.Parsec.Pos (SourcePos)
 
 data GenericZephyrAtom quote sym =
     IntegerZ !Int64
@@ -30,9 +40,6 @@ data GenericZephyrAtom quote sym =
   | ArgHoleZ
   | EnterZipperZ
   | CutZ
-
-  -- Work with data on the stack
-  | CheckTagZ !Word16
 
   -- Primitives
   | SwapZ
@@ -58,11 +65,11 @@ data GenericZephyrAtom quote sym =
   | TagZ !ZippyTyRef !Word16 !Int
     deriving (Show, Functor)
 
-data ZephyrSymbolDefinition =
-    ZephyrSymbolDefinition !ZephyrWord !ZephyrBuilder
-    deriving Show
+data GenericZephyrSymbolDefinition zephyr =
+    ZephyrSymbolDefinition !ZephyrWord !zephyr
+    deriving (Show, Functor, Traversable, Foldable)
 
-zephyrSymbolName :: ZephyrSymbolDefinition -> ZephyrWord
+zephyrSymbolName :: GenericZephyrSymbolDefinition zephyr -> ZephyrWord
 zephyrSymbolName (ZephyrSymbolDefinition name _) = name
 
 data ZephyrProgram =
@@ -80,9 +87,20 @@ newtype CompiledZephyr = CompiledZephyr (Vector CompiledZephyrAtom)
 data CompiledZephyrSymbol = CompiledZephyrSymbol !ZephyrQualifiedWord !CompiledZephyr deriving Show
 
 newtype ZephyrWord = ZephyrWord Text deriving (Show, Eq, Ord, IsString, Hashable)
+
+data SourceRange = SourceRange !SourcePos !SourcePos
+                   deriving Show
+
 type ZephyrBuilderAtom = GenericZephyrAtom ZephyrBuilder ZephyrWord
-newtype ZephyrBuilder = ZephyrBuilder (DList ZephyrBuilderAtom)
+data ZephyrBuilderOp = ZephyrStateAssertion !(ZephyrExecState ZippyTyVarName) !SourceRange
+                     | ZephyrAtom !ZephyrBuilderAtom !SourceRange
+                       deriving Show
+newtype ZephyrBuilder = ZephyrBuilder (DList ZephyrBuilderOp)
     deriving (Show, Monoid)
+
+type ZephyrTyCheckedAtom = GenericZephyrAtom ZephyrTyChecked ZephyrWord
+newtype ZephyrTyChecked = ZephyrTyChecked [ZephyrTyCheckedAtom]
+    deriving Show
 
 symbolBytecode :: CompiledZephyrSymbol -> Vector CompiledZephyrAtom
 symbolBytecode (CompiledZephyrSymbol _ (CompiledZephyr bc)) = bc
@@ -102,7 +120,6 @@ mapQuote _ CurAtomZ = CurAtomZ
 mapQuote _ ArgHoleZ = ArgHoleZ
 mapQuote _ EnterZipperZ = EnterZipperZ
 mapQuote _ CutZ = CutZ
-mapQuote _ (CheckTagZ tag) = CheckTagZ tag
 mapQuote _ SwapZ = SwapZ
 mapQuote _ DupZ = DupZ
 mapQuote _ ZapZ = ZapZ
@@ -137,6 +154,7 @@ data ZephyrEvalError = CatZExpectsTwoQuotes
                      | EnterZipperExpects1Zipper
                      | CannotYieldNonZipper
                      | NeedAtomOrZipperAtRoot
+                     | UnConsZExpectsQuote
                        deriving Show
 
 type ZephyrStack = [ZephyrD]
@@ -161,10 +179,6 @@ type ZephyrExports = HM.HashMap ZephyrWord ZephyrProgram
 
 -- * Types
 
-data QualificationType = Unambiguous Text
-                       | Ambiguous [Text]
-                         deriving Show
-
 type RecZippyFieldType = GenericZippyTyCon ZephyrScopedTy
 newtype RecZippyTyCon = RecZippyTyCon { unRecTy :: GenericZippyTyCon (ZippyFieldType RecZippyTyCon) }
     deriving (Show, Ord, Eq)
@@ -176,12 +190,61 @@ data ZephyrScopedTy = Local !ZippyTyVarName
 
 -- * Packages
 
-data ZephyrPackage =
+data GenericZephyrPackage zephyr =
      ZephyrPackage
      { zephyrPackageName  :: !ZephyrWord
 
      , zephyrDependencies :: [ZephyrWord]
      , zephyrExports      :: [ZephyrWord]
      , zephyrTypes        :: [GenericZippyAlgebraicT ZippyTyVarName ZephyrScopedTy]
-     , zephyrSymbols      :: [ZephyrSymbolDefinition] }
-    deriving Show
+     , zephyrSymbols      :: [GenericZephyrSymbolDefinition zephyr] }
+    deriving (Show, Functor, Foldable, Traversable)
+
+type ZephyrPackage = GenericZephyrPackage ZephyrBuilder
+type ZephyrTyCheckedPackage = GenericZephyrPackage ZephyrTyChecked
+
+-- * Type system
+
+data ZephyrExecState tyVar = ZephyrExecState !(ZephyrZipperTy tyVar) !(ZephyrStackTy tyVar)
+                             deriving (Show, Eq, Functor, Traversable, Foldable)
+
+type RecZephyrType tyVar = GenericZippyTyCon (ZephyrZipperTy tyVar)
+data ZephyrZipperTy tyVar = ZipperVar tyVar
+                          | ZipperConcrete (ZippyFieldType (RecZephyrType tyVar))
+                            deriving (Show, Eq, Functor, Traversable, Foldable)
+infixl 7 :>
+
+data ZephyrStackAtomTy tyVar = StackAtomSimple ZippySimpleT
+                             | StackAtomQuote (ZephyrEffect tyVar)
+                             | StackAtomZipper (ZephyrZipperTy tyVar)
+                             | StackAtomVar tyVar
+                               deriving (Show, Eq, Functor, Traversable, Foldable)
+--                         | ZephyrStackTyList (ZephyrStackTy tyVar)
+--                         | ZephyrStackTyTuple [ZephyrStackTy tyVar]
+
+data ZephyrStackTy tyVar = StackBottom
+                         | StackVar tyVar
+                         | ZephyrStackTy tyVar :> ZephyrStackAtomTy tyVar
+                           deriving (Show, Eq, Functor, Traversable, Foldable)
+
+data ZephyrEffect tyVar = ZephyrEffect (ZephyrZipperTy tyVar) (ZephyrStackTy tyVar) (ZephyrStackTy tyVar)
+                          deriving (Show, Eq, Functor, Traversable, Foldable)
+
+newtype ZephyrTyVar = ZephyrTyVar Int
+    deriving (Show, Eq, Ord, Hashable)
+
+newtype ZephyrEffectWithNamedVars = ZephyrEffectWithNamedVars (ZephyrEffect ZippyTyVarName)
+
+allTyVariables :: Traversable f => f ZippyTyVarName -> [ZippyTyVarName]
+allTyVariables eff = S.toList (execWriter (mapM collectName eff) :: S.Set ZippyTyVarName)
+    where collectName :: ZippyTyVarName -> Writer (S.Set ZippyTyVarName) ()
+          collectName name = tell (S.singleton name)
+
+-- * HasSourceRange class and instances
+
+class HasSourceRange entity where
+    sourceRange :: entity -> SourceRange
+
+instance HasSourceRange ZephyrBuilderOp where
+    sourceRange (ZephyrStateAssertion _ range) = range
+    sourceRange (ZephyrAtom _ range) = range

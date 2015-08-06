@@ -11,6 +11,7 @@ import Data.String
 import Data.Monoid
 import Data.Char
 import Data.ByteString (ByteString)
+import qualified Data.Text as T
 import qualified Data.Vector as V
 import qualified Data.Set as S
 import qualified Data.DList as D
@@ -42,6 +43,12 @@ zephyrConsIdentifier = do name <- many1 (satisfy (\c -> c /= ' ' && c /= '\t' &&
 whitespace :: Parser ()
 whitespace = (oneOf " \t\v\r\n" *> optional whitespace) <|> (char '{' *> consumeComment *> optional whitespace) <|> pure ()
     where consumeComment = many (satisfy (/= '}')) *> char '}'
+
+stateAssertionP :: Parser (ZephyrExecState ZippyTyVarName)
+stateAssertionP = char '!' *> whitespace *>
+                  char '(' *> whitespace *>
+                  (ZephyrExecState <$> (zipperTyP <* whitespace <* char '|' <* whitespace)
+                                   <*> (stackTyP <* whitespace)) <* char ')' <* whitespace
 
 atomP :: Parser ZephyrBuilderAtom
 atomP = unquotedAtomP <|>
@@ -240,9 +247,22 @@ parseZephyrStack bs = parse (many (literalP <* whitespace)) "<network>" bs
 zephyrP :: Parser ZephyrBuilder
 zephyrP = (whitespace <|> pure ()) *> go (ZephyrBuilder mempty) <?> "definition"
     where go b@(ZephyrBuilder rest) =
-              ((atomP <* whitespace) >>= \atom ->
-                   go (ZephyrBuilder (rest <> D.singleton atom))) <|>
+              stateAssertionAndContinue rest <|>
+              atomAndContinue rest <|>
               pure b
+
+          stateAssertionAndContinue rest =
+              do start <- getPosition
+                 assertion <- stateAssertionP
+                 end <- getPosition
+                 whitespace
+                 go (ZephyrBuilder (rest <> D.singleton (ZephyrStateAssertion assertion (SourceRange start end))))
+          atomAndContinue rest =
+              do start <- getPosition
+                 atom <- atomP
+                 end <- getPosition
+                 whitespace
+                 go (ZephyrBuilder (rest <> D.singleton (ZephyrAtom atom (SourceRange start end))))
 
 dependency :: Parser ZephyrWord
 dependency = fromString <$> (string "IMPORT" *> whitespace *> zephyrIdentifier)
@@ -308,5 +328,74 @@ scopeTypes ty@(ZippyAlgebraicT (ZippyTyCon _ tyVars) _) =
         scopeGlobal (Local _) = error "Local found in parsed type"
     in fmap scopeGlobal ty
 
+zephyrEffectP :: Parser (ZephyrEffect ZippyTyVarName)
+zephyrEffectP = ZephyrEffect <$> (zipperTyP <* whitespace <* char '|' <* whitespace)
+                             <*> (stackTyP  <* whitespace <* string "-->" <* whitespace)
+                             <*> (stackTyP <* whitespace)
+
+zephyrParens x = char '(' *> optional whitespace *> x <* optional whitespace <* char ')' <* optional whitespace
+
+zipperTyP :: Parser (ZephyrZipperTy ZippyTyVarName)
+zipperTyP = (ZipperVar <$> (zephyrTyVarNameP <* whitespace)) <|>
+            (ZipperConcrete <$> zipperConcreteTyP) <|>
+             zephyrParens zipperTyP <?> "zipper atom type"
+zipperConcreteTyP :: Parser (ZippyFieldType (RecZephyrType ZippyTyVarName))
+zipperConcreteTyP =
+    try (SimpleFieldT <$> (zephyrSimpleTyP <* whitespace)) <|>
+    try (RefFieldT <$> (ZippyTyCon <$> (zephyrTyNameP <* whitespace) <*> pure V.empty)) <|>
+    zephyrParens (RefFieldT <$> (ZippyTyCon <$> (zephyrTyNameP <* whitespace)
+                                            <*> (V.fromList <$>
+                                                  many zipperTyP)))
+
+zephyrSimpleTyP :: Parser ZippySimpleT
+zephyrSimpleTyP = (IntegerT  <$ string "Integer") <|>
+                  (FloatingT <$ string "Floating") <|>
+                  (TextT     <$ string "Text") <|>
+                  (BinaryT   <$ string "Binary") <?> "simple type"
+
+zephyrTyVarNameP :: Parser ZippyTyVarName
+zephyrTyVarNameP = fromString <$> ((:) <$> satisfy isLower
+                                       <*> many (satisfy (\c -> isLower c || isUpper c || isDigit c ||
+                                                          c == '_' || c == '\'')))
+zephyrTyNameP :: Parser ZippyTyName
+zephyrTyNameP = do tyOrPkgName <- fromString <$>
+                                  many1 identChar
+                   if not . isUpper . T.head $ tyOrPkgName
+                      then do char ':'
+                              tyName <- fromString <$> ((:) <$> satisfy isUpper
+                                                            <*> many identChar)
+                              return (ZippyTyName tyOrPkgName tyName)
+                      else return (ZippyTyName "" tyOrPkgName)
+
+    where identChar = satisfy (\c -> isLower c || isUpper c || isDigit c ||
+                               c == '_' || c == '\'')
+
+stackTyP :: Parser (ZephyrStackTy ZippyTyVarName)
+stackTyP = do stackTy <- (StackBottom <$ char '0') <|>
+                         (StackVar <$> (char '*' *> zephyrTyVarNameP)) <?> "stack base"
+              whitespace
+              tryContinueP stackTy
+    where tryContinueP parent = try (tryContinueP =<< (((parent :>) <$> stackAtomTyP) <* whitespace)) <|>
+                                return parent
+
+stackAtomTyP :: Parser (ZephyrStackAtomTy ZippyTyVarName)
+stackAtomTyP = try (StackAtomSimple <$> zephyrSimpleTyP <* whitespace) <|>
+               try (StackAtomZipper . ZipperConcrete . RefFieldT <$>
+                    (ZippyTyCon <$> zephyrTyNameP <* whitespace
+                                <*> pure V.empty)) <|>
+               try (StackAtomVar <$> zephyrTyVarNameP <* whitespace) <|>
+               zephyrParens
+                 (try (StackAtomQuote <$> zephyrEffectP) <|>
+                  try (StackAtomZipper <$> zipperTyP) <|>
+                  stackAtomTyP)
+
 readZephyrPackage :: FilePath -> IO (Either ParseError ZephyrPackage)
 readZephyrPackage fp = parseFromFile packageP fp
+
+instance IsString ZephyrEffectWithNamedVars where
+    fromString s = case parse zephyrEffectP "<haskell source>" (fromString s) of
+                     Left err -> error (show err)
+                     Right x -> ZephyrEffectWithNamedVars x
+
+effect :: ZephyrEffectWithNamedVars -> ZephyrEffect ZippyTyVarName
+effect (ZephyrEffectWithNamedVars x) = x
