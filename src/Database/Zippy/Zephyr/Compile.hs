@@ -24,18 +24,18 @@ import qualified Data.Set as S
 
 import Debug.Trace
 
-boolAtomTy = StackAtomZipper (ZipperConcrete (RefFieldT (ZippyTyCon (ZippyTyName "base" "Bool") mempty)))
-scopedTyToZipper (Local var) = ZipperVar var
-scopedTyToZipper (Global (SimpleFieldT s)) = ZipperConcrete (SimpleFieldT s)
-scopedTyToZipper (Global (RefFieldT r)) = ZipperConcrete (RefFieldT (fmap scopedTyToZipper r))
+boolAtomTy = stackAtomKindedZephyrZipper (RefFieldT (ZippyTyCon (ZippyTyName "base" "Bool") mempty))
+scopedTyToZipper (Local var) = ZephyrVarT var
+scopedTyToZipper (Global (SimpleFieldT s)) = ZephyrZipperT (SimpleFieldT s)
+scopedTyToZipper (Global (RefFieldT r)) = ZephyrZipperT (RefFieldT (fmap scopedTyToZipper r))
 
 genDefinitionsForType :: ZippyTyRef -> GenericZippyAlgebraicT ZippyTyVarName ZephyrScopedTy -> [(ZephyrEffect ZippyTyVarName, GenericZephyrSymbolDefinition ZephyrTyChecked)]
 genDefinitionsForType tyRef (ZippyAlgebraicT tyCon cons) = concatMap genDefinitionsForCon (zip [0..] (V.toList cons))
-    where tyConZ = ZipperConcrete (RefFieldT (fmap ZipperVar tyCon))
+    where tyConZ = ZephyrZipperT (RefFieldT (fmap ZephyrVarT tyCon))
 
           genDefinitionsForCon :: (Int, GenericZippyDataCon ZephyrScopedTy) -> [(ZephyrEffect ZippyTyVarName, GenericZephyrSymbolDefinition ZephyrTyChecked)]
           genDefinitionsForCon (conIndex, ZippyDataCon (ZippyDataConName conName) argTys) =
-              [ ( ZephyrEffect (ZipperVar "$z") (StackVar "$s" :> StackAtomZipper tyConZ) (StackVar "$s" :> boolAtomTy)
+              [ ( ZephyrEffect (ZephyrVarT "$z") (ZephyrVarT "$s" :> tyConZ) (ZephyrVarT "$s" :> boolAtomTy)
                 , ZephyrSymbolDefinition (ZephyrWord ("IS-" <> conName <> "?"))
                   ( ZephyrTyChecked $
                     [ QuoteZ (ZephyrTyChecked $
@@ -45,14 +45,14 @@ genDefinitionsForType tyRef (ZippyAlgebraicT tyCon cons) = concatMap genDefiniti
                     , EnterZipperZ
                     , SwapZ ] ))
 
-              , ( ZephyrEffect tyConZ (StackVar "$s") (StackVar "$s" :> boolAtomTy)
+              , ( ZephyrEffect tyConZ (ZephyrVarT "$s") (ZephyrVarT "$s" :> boolAtomTy)
                 , ZephyrSymbolDefinition (ZephyrWord ("CUR-IS-" <> conName <> "?"))
                   ( ZephyrTyChecked $
                     [ CurTagZ
                     , IntegerZ (fromIntegral conIndex)
                     , EqZ ] ) )
 
-              , ( ZephyrEffect (ZipperVar "$z") (StackVar "$s") (StackVar "$s" :> StackAtomZipper tyConZ)
+              , ( ZephyrEffect (ZephyrVarT "$z") (ZephyrVarT "$s") (ZephyrVarT "$s" :> tyConZ)
                 , ZephyrSymbolDefinition (ZephyrWord conName)
                   ( ZephyrTyChecked $
                     [ TagZ tyRef (fromIntegral conIndex) (V.length argTys) ] ) ) ] ++
@@ -61,7 +61,7 @@ genDefinitionsForType tyRef (ZippyAlgebraicT tyCon cons) = concatMap genDefiniti
           genDefinitionsForArg :: (Int64, GenericZippyField ZephyrScopedTy) -> [(ZephyrEffect ZippyTyVarName, GenericZephyrSymbolDefinition ZephyrTyChecked)]
           genDefinitionsForArg (i, ZippyUnnamedField _) = []
           genDefinitionsForArg (i, ZippyNamedField (ZippyDataArgName argName) fieldTy) =
-              [ ( ZephyrEffect tyConZ (StackVar "$s" :> StackAtomQuote (ZephyrEffect (scopedTyToZipper fieldTy) (StackVar "$s") (StackVar "$s'"))) (StackVar "$s'")
+              [ ( ZephyrEffect tyConZ (ZephyrVarT "$s" :> ZephyrQuoteT (ZephyrEffect (scopedTyToZipper fieldTy) (ZephyrVarT "$s") (ZephyrVarT "$s'"))) (ZephyrVarT "$s'")
                 , ZephyrSymbolDefinition (ZephyrWord ("VISIT-" <> argName))
                   ( ZephyrTyChecked $
                     [ IntegerZ i
@@ -71,7 +71,7 @@ genDefinitionsForType tyRef (ZippyAlgebraicT tyCon cons) = concatMap genDefiniti
 
                     , ZipUpZ ]) )
 
-              , ( ZephyrEffect tyConZ (StackVar "$s") (StackVar "$s" :> boolAtomTy)
+              , ( ZephyrEffect tyConZ (ZephyrVarT "$s") (ZephyrVarT "$s" :> boolAtomTy)
                 , ZephyrSymbolDefinition (ZephyrWord ("CHK-HOLE-" <> argName))
                   ( ZephyrTyChecked $
                     [ ArgHoleZ
@@ -135,7 +135,11 @@ compilePackages pkgs rootTy =
                       pretypedSymbols <- buildSymbolEnv <$>
                                          mapM (\(pkgName, (ty, ZephyrSymbolDefinition symName _)) -> ((ZephyrWord pkgName, symName),) <$> instantiate (ZephyrEffectWithNamedVars ty)) definitions
                       tyCheckPackages pretypedSymbols allTypes pkgs
-    in trace ("Type checked " ++ show tyChecked ++ ". With types " ++ show tyInstantiationEnv) undefined
+
+        showError (locs, err) = "At " ++ show locs ++ ":\n" ++ showError' err
+        showError' (KindMismatch ty1 ty2) = "Kind mismatch between " ++ show (kindOf ty1) ++ " and " ++ show (kindOf ty2) ++ " " ++ show ty1 ++ " " ++ show ty2
+        showError' x = show x
+    in trace ("Type checked " ++ either (("ERROR\n" ++) . showError) show tyChecked ++ ". With types " ++ show tyInstantiationEnv) undefined
 
 
     --     namesToInts = HM.fromList (zip names [0..])

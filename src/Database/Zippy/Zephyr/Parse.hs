@@ -1,4 +1,4 @@
-{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE OverloadedStrings, RankNTypes #-}
 module Database.Zippy.Zephyr.Parse where
 
 import Database.Zippy.Types
@@ -335,9 +335,9 @@ zephyrEffectP = ZephyrEffect <$> (zipperTyP <* whitespace <* char '|' <* whitesp
 
 zephyrParens x = char '(' *> optional whitespace *> x <* optional whitespace <* char ')' <* optional whitespace
 
-zipperTyP :: Parser (ZephyrZipperTy ZippyTyVarName)
-zipperTyP = (ZipperVar <$> (zephyrTyVarNameP <* whitespace)) <|>
-            (ZipperConcrete <$> zipperConcreteTyP) <|>
+zipperTyP :: Parser (ZephyrZipperT ZippyTyVarName)
+zipperTyP = (ZephyrVarT <$> (zephyrTyVarNameP <* whitespace)) <|>
+            (zipperKindedZephyrZipper <$> zipperConcreteTyP) <|>
              zephyrParens zipperTyP <?> "zipper atom type"
 zipperConcreteTyP :: Parser (ZippyFieldType (RecZephyrType ZippyTyVarName))
 zipperConcreteTyP =
@@ -370,24 +370,24 @@ zephyrTyNameP = do tyOrPkgName <- fromString <$>
     where identChar = satisfy (\c -> isLower c || isUpper c || isDigit c ||
                                c == '_' || c == '\'')
 
-stackTyP :: Parser (ZephyrStackTy ZippyTyVarName)
-stackTyP = do stackTy <- (StackBottom <$ char '0') <|>
-                         (StackVar <$> (char '*' *> zephyrTyVarNameP)) <?> "stack base"
+stackTyP :: Parser (ZephyrStackT ZippyTyVarName)
+stackTyP = do stackTy <- (ZephyrStackBottomT <$ char '0') <|>
+                         (ZephyrVarT <$> (char '*' *> zephyrTyVarNameP)) <?> "stack base"
               whitespace
               tryContinueP stackTy
-    where tryContinueP parent = try (tryContinueP =<< (((parent :>) <$> stackAtomTyP) <* whitespace)) <|>
+    where tryContinueP parent = try (tryContinueP =<< (stackAtomTyP (\stackAtom -> pure (parent :> stackAtom)) <* whitespace)) <|>
                                 return parent
 
-stackAtomTyP :: Parser (ZephyrStackAtomTy ZippyTyVarName)
-stackAtomTyP = try (StackAtomSimple <$> zephyrSimpleTyP <* whitespace) <|>
-               try (StackAtomZipper . ZipperConcrete . RefFieldT <$>
-                    (ZippyTyCon <$> zephyrTyNameP <* whitespace
-                                <*> pure V.empty)) <|>
-               try (StackAtomVar <$> zephyrTyVarNameP <* whitespace) <|>
-               zephyrParens
-                 (try (StackAtomQuote <$> zephyrEffectP) <|>
-                  try (StackAtomZipper <$> zipperTyP) <|>
-                  stackAtomTyP)
+stackAtomTyP :: (forall k. (IsStackAtomKind k ~ True, IsKind k) => ZephyrT k ZippyTyVarName -> Parser a) -> Parser a
+stackAtomTyP cont = try (cont =<< (zipperKindedZephyrZipper . SimpleFieldT <$> zephyrSimpleTyP <* whitespace)) <|>
+                    try (cont =<< (zipperKindedZephyrZipper . RefFieldT <$>
+                                   (ZippyTyCon <$> zephyrTyNameP <* whitespace
+                                               <*> pure V.empty))) <|>
+                    try (cont =<< (stackAtomVarT <$> zephyrTyVarNameP <* whitespace)) <|>
+                    zephyrParens
+                    (try (cont =<< (ZephyrQuoteT <$> zephyrEffectP)) <|>
+                     try (cont =<< zipperTyP) <|>
+                     stackAtomTyP cont)
 
 readZephyrPackage :: FilePath -> IO (Either ParseError ZephyrPackage)
 readZephyrPackage fp = parseFromFile packageP fp

@@ -1,4 +1,4 @@
-{-# LANGUAGE RecordWildCards, TupleSections, RankNTypes, OverloadedStrings, MultiParamTypeClasses #-}
+{-# LANGUAGE RecordWildCards, TupleSections, RankNTypes, OverloadedStrings, MultiParamTypeClasses, LambdaCase, ScopedTypeVariables #-}
 module Database.Zippy.Zephyr.TyCheck where
 
 import Database.Zippy.Zephyr.Types
@@ -12,6 +12,7 @@ import Control.Applicative
 import Control.Monad.ST
 import Control.Monad.State hiding (mapM)
 
+import Data.Proxy
 import Data.STRef
 import Data.Traversable (mapM)
 import Data.Foldable (Foldable, foldlM)
@@ -43,26 +44,41 @@ instance Monoid ZephyrTyErrorLocation where
 instance Show ZephyrTyErrorLocation where
     show (ZephyrTyErrorLocation loc) = show (loc Here)
 
-data ZephyrTyDesc = ZephyrTyDescStack (ZephyrStackTy ZephyrTyVar) [ZephyrTyCheckLocation]
-                  | ZephyrTyDescZipper (ZephyrZipperTy ZephyrTyVar) [ZephyrTyCheckLocation]
-                  | ZephyrTyDescStackAtom (ZephyrStackAtomTy ZephyrTyVar) [ZephyrTyCheckLocation]
-                  | ZephyrTyDescFree ZephyrTyVar [ZephyrTyCheckLocation]
-                    deriving Show
+data ZephyrTyDesc where
+    ZephyrTyDesc :: IsKind k => ZephyrT k ZephyrTyVar -> [ZephyrTyCheckLocation] -> ZephyrTyDesc
+    ZephyrTyDescFree :: Maybe ZephyrKind -> ZephyrTyVar -> [ZephyrTyCheckLocation]-> ZephyrTyDesc
+deriving instance Show ZephyrTyDesc
+
+descKind :: ZephyrTyDesc -> Maybe ZephyrKind
+descKind (ZephyrTyDescFree k _ _) = k
+descKind (ZephyrTyDesc z _) = Just $ kindOf z
+
+descKindsMatch :: ZephyrTyDesc -> ZephyrTyDesc -> Bool
+descKindsMatch a b = case (descKind a, descKind b) of
+                       (Nothing, _) -> True
+                       (_, Nothing) -> True
+                       (Just a, Just b) -> a == b
+
+descLoc :: ZephyrTyDesc -> [ZephyrTyCheckLocation]
+descLoc (ZephyrTyDesc _ loc) = loc
+descLoc (ZephyrTyDescFree _ _ loc) = loc
 
 data ZephyrTyCheckOp = ZephyrTyCheckCheckState !ZephyrTyErrorLocation !(ZephyrExecState ZephyrTyVar)
                      | ZephyrTyCheckCheckEffect !ZephyrTyErrorLocation !(ZephyrEffect ZephyrTyVar)
                      | ZephyrTyCheckCheckSymbol !ZephyrTyErrorLocation !ZephyrTyVar
                        deriving Show
 
-data ZephyrTyCheckError = InfinitelyRecursiveType !ZephyrTyVar !ZephyrTyDesc
-                        | KindMismatch !ZephyrTyDesc !ZephyrTyDesc
-                        | InvalidDemotion !(ZephyrStackAtomTy ZephyrTyVar) -- ^ Cannot demote stack atom to zipper atom
-                        | CannotUnify !ZephyrTyDesc {- actual -} !ZephyrTyDesc {- expected -}
-                        | HitStackBottom
-                        | UncheckableOp
+data ZephyrTyCheckError where
+    InfinitelyRecursiveType :: !ZephyrTyVar -> !ZephyrTyDesc -> ZephyrTyCheckError
+    KindMismatch :: (IsKind k1, IsKind k2) => !(ZephyrT k1 ZephyrTyVar) -> !(ZephyrT k2 ZephyrTyVar) -> ZephyrTyCheckError
+    ExpectingKind :: !ZephyrKind -> !ZephyrKind -> ZephyrTyCheckError
+    InvalidDemotion :: !(ZephyrT ZephyrStackAtomK ZephyrTyVar) -> ZephyrTyCheckError -- ^ Cannot demote stack atom to zipper atom
+    CannotUnify :: !ZephyrTyDesc {- actual -} -> !ZephyrTyDesc {- expected -} -> ZephyrTyCheckError
+    HitStackBottom :: ZephyrTyCheckError
+    UncheckableOp :: ZephyrTyCheckError
 
-                        | GenericFail !String
-                          deriving Show
+    GenericFail :: !String -> ZephyrTyCheckError
+deriving instance Show ZephyrTyCheckError
 data ZephyrTyCheckLocation = LocatedAt !SourceRange !ZephyrTyCheckLocation
                            | WhileCheckingAtom !(GenericZephyrAtom ZephyrBuilder ZephyrWord) !ZephyrTyCheckLocation
                            | WhileCheckingStateAssertion !(ZephyrExecState ZippyTyVarName) !ZephyrTyCheckLocation
@@ -72,7 +88,6 @@ data ZephyrTyCheckLocation = LocatedAt !SourceRange !ZephyrTyCheckLocation
 newtype ZephyrTyCheckM s a = ZephyrTyCheckM { runZephyrTyCheckM :: ZephyrTyErrorLocation ->
                                                                    ZephyrTyCheckState s ->
                                                                    ST s (Either ([ZephyrTyCheckLocation], ZephyrTyCheckError) a, ZephyrTyCheckState s) }
--- type ZephyrTyCheckM s = StateT (ZephyrTyCheckState s) (ST s)
 
 instance Monad (ZephyrTyCheckM s) where
     return = pure
@@ -96,10 +111,8 @@ instance MonadState (ZephyrTyCheckState s) (ZephyrTyCheckM s) where
     put s = ZephyrTyCheckM $ \_ _ -> pure (Right (), s)
 
 tyDescLoc :: ZephyrTyDesc -> [ZephyrTyCheckLocation]
-tyDescLoc (ZephyrTyDescFree _ loc) = loc
-tyDescLoc (ZephyrTyDescStack _ loc) = loc
-tyDescLoc (ZephyrTyDescStackAtom _ loc) = loc
-tyDescLoc (ZephyrTyDescZipper _ loc) = loc
+tyDescLoc (ZephyrTyDescFree _ _ loc) = loc
+tyDescLoc (ZephyrTyDesc _ loc) = loc
 
 dieTyCheck :: [ZephyrTyCheckLocation] -> ZephyrTyCheckError -> ZephyrTyCheckM s a
 dieTyCheck otherLocs err = ZephyrTyCheckM $ \(ZephyrTyErrorLocation loc) s -> pure (Left (loc Here:otherLocs, err), s)
@@ -134,9 +147,6 @@ inNestedLocation :: ZephyrTyErrorLocation -> ZephyrTyCheckM s a -> ZephyrTyCheck
 inNestedLocation nestedLoc action =
     ZephyrTyCheckM $ \loc s -> runZephyrTyCheckM action (loc <> nestedLoc) s
 
--- simpleTyCheckPackages :: ZephyrTypeLookupEnv -> [ZephyrPackage] -> [ZephyrTyCheckedPackage]
--- simpleTyCheckPackages types pkgs = runST (newTyCheckState >>= evalStateT (tyCheckPackages types pkgs))
-
 newTyCheckState :: ST s (ZephyrTyCheckState s)
 newTyCheckState = do var <- newSTRef 0
                      tyVars <- HT.new
@@ -153,7 +163,7 @@ getPointForVariable tyVar =
        tyVarPoint <- zephyrST (HT.lookup tyVars tyVar)
        case tyVarPoint of
          Nothing -> zephyrST $
-                    do newPoint <- fresh (ZephyrTyDescFree tyVar mempty)
+                    do newPoint <- fresh (ZephyrTyDescFree Nothing tyVar mempty)
                        HT.insert tyVars tyVar newPoint
                        return newPoint
          Just tyVarPoint -> return tyVarPoint
@@ -206,78 +216,52 @@ tyCheckPackages pretypedSymbols types pkgs = tyCheck
 type TyCheckEndoM s x = x -> ZephyrTyCheckM s x
 
 simplifyTyDesc :: TyCheckEndoM s ZephyrTyDesc
-simplifyTyDesc (ZephyrTyDescFree v loc) = pure (ZephyrTyDescFree v loc)
-simplifyTyDesc (ZephyrTyDescZipper z loc) = ZephyrTyDescZipper <$> simplifyZipper z <*> pure loc
-simplifyTyDesc (ZephyrTyDescStack s loc) = ZephyrTyDescStack <$> simplifyStkState s <*> pure loc
-simplifyTyDesc (ZephyrTyDescStackAtom s loc) = ZephyrTyDescStackAtom <$> simplifyStackAtom s <*> pure loc
+simplifyTyDesc (ZephyrTyDescFree k v loc) = pure (ZephyrTyDescFree k v loc)
+simplifyTyDesc (ZephyrTyDesc z loc) = ZephyrTyDesc <$> simplifyZephyrT z <*> pure loc
 
 simplifyEffect :: TyCheckEndoM s (ZephyrEffect ZephyrTyVar)
-simplifyEffect eff@(ZephyrEffect zipper before after) = trace ("Simplify effect " ++ show eff) (ZephyrEffect <$> simplifyZipper zipper <*> simplifyStkState before <*> simplifyStkState after)
+simplifyEffect eff@(ZephyrEffect zipper before after) = trace ("Simplify effect " ++ show eff) (ZephyrEffect <$> simplifyZephyrT zipper
+                                                                                                             <*> simplifyZephyrT before
+                                                                                                             <*> simplifyZephyrT after)
 
-simplifyStkState :: TyCheckEndoM s (ZephyrStackTy ZephyrTyVar)
-simplifyStkState StackBottom = pure StackBottom
-simplifyStkState k@(st :> stackTy) = trace ("Simplify stack " ++ show k) ((:>) <$> simplifyStkState st
-                                                                               <*> simplifyStackAtom stackTy)
-simplifyStkState (StackVar tyVar) =
+simplifyZephyrT :: TyCheckEndoM s (ZephyrT k ZephyrTyVar)
+simplifyZephyrT z | trace ("simplify " ++ show z) False = undefined
+simplifyZephyrT (ZephyrZipperT (SimpleFieldT s)) = pure (ZephyrZipperT (SimpleFieldT s))
+simplifyZephyrT (ZephyrZipperT (RefFieldT r)) = ZephyrZipperT . RefFieldT <$> simplifyZipperTyCon r
+simplifyZephyrT (ZephyrQuoteT eff) = ZephyrQuoteT <$> simplifyEffect eff
+simplifyZephyrT ZephyrStackBottomT = pure ZephyrStackBottomT
+simplifyZephyrT (st :> top) = ((:>) <$> simplifyZephyrT st <*> simplifyZephyrT top)
+simplifyZephyrT (ZephyrVarT tyVar) =
     do tyDesc <- zephyrST . descriptor =<< getPointForVariable tyVar
        case tyDesc of
-         ZephyrTyDescFree tyVar _ -> pure (StackVar tyVar)
-         ZephyrTyDescStack s _ -> case s of
-                                    StackVar sVar
-                                        | sVar == tyVar -> pure (StackVar sVar)
-                                    _ -> simplifyStkState s
-         tyDesc -> dieTyCheck [] (GenericFail "Kind mismatch during simplification")
+         ZephyrTyDescFree _ tyVar _ -> pure (ZephyrVarT tyVar)
+         ZephyrTyDesc (ZephyrVarT v) _
+             | v == tyVar -> pure (ZephyrVarT v)
+         ZephyrTyDesc ty _ -> case safeCoercedKind ty of
+                                Just ty -> simplifyZephyrT ty
+                                Nothing -> fail "Kind mismatch during simplification"
 
-simplifyStackAtom :: TyCheckEndoM s (ZephyrStackAtomTy ZephyrTyVar)
-simplifyStackAtom (StackAtomQuote eff) = StackAtomQuote <$> trace ("Simplify atom " ++ show eff) (simplifyEffect eff)
-simplifyStackAtom (StackAtomZipper zip) = StackAtomZipper <$> simplifyZipper zip
-simplifyStackAtom (StackAtomVar tyVar) =
-    do tyDesc <- zephyrST . descriptor =<< getPointForVariable tyVar
-       case tyDesc of
-         ZephyrTyDescFree tyVar _ -> pure (StackAtomVar tyVar)
-         ZephyrTyDescStackAtom s _ -> case s of
-                                       StackAtomVar sVar
-                                           | sVar == tyVar -> pure (StackAtomVar sVar)
-                                       _ -> trace ("Simplifying stack atom " ++ show s ++ " from " ++ show tyVar) (simplifyStackAtom s)
-         ZephyrTyDescZipper z _ -> simplifyStackAtom (StackAtomZipper z)
-         _ -> fail "Kind mismatch during simplification (stack atom)"
-simplifyStackAtom x = pure x
-
-simplifyZipper :: TyCheckEndoM s (ZephyrZipperTy ZephyrTyVar)
-simplifyZipper (ZipperConcrete (SimpleFieldT s)) = pure (ZipperConcrete (SimpleFieldT s))
-simplifyZipper (ZipperConcrete (RefFieldT r)) = ZipperConcrete . RefFieldT <$> simplifyZipperTyCon r
-simplifyZipper (ZipperVar tyVar) =
-    do tyDesc <- zephyrST . descriptor =<< getPointForVariable tyVar
-       case tyDesc of
-         ZephyrTyDescFree tyVar _ -> pure (ZipperVar tyVar)
-         ZephyrTyDescZipper s _ -> case s of
-                                    ZipperVar sVar
-                                        | sVar == tyVar -> pure (ZipperVar sVar)
-                                    _ -> simplifyZipper s
-         ZephyrTyDescStackAtom stkAtom _ -> simplifyZipper =<< demoteStackAtom stkAtom
-         _ -> fail "Kind mismatch during simplification (zip atom)"
-
-simplifyZipperTyCon :: TyCheckEndoM s (GenericZippyTyCon (ZephyrZipperTy ZephyrTyVar))
+simplifyZipperTyCon :: TyCheckEndoM s (GenericZippyTyCon (ZephyrT ZephyrZipperK ZephyrTyVar))
 simplifyZipperTyCon (ZippyTyCon tyName tyArgs) =
-    ZippyTyCon tyName <$> mapM simplifyZipper tyArgs
+    ZippyTyCon tyName <$> mapM simplifyZephyrT tyArgs
 
 unifySymbols :: ZephyrSymbolEnv ZephyrTyVar -> [GenericZephyrPackage (ZephyrEffect ZephyrTyVar)] -> ZephyrTyCheckM s ()
 unifySymbols env typedPackages =
     mapM (\pkg -> mapM (unifyPkgSymbol (zephyrPackageName pkg)) (zephyrSymbols pkg)) typedPackages >> return ()
     where unifyPkgSymbol pkgName (ZephyrSymbolDefinition sym eff) =
               let Just tyVar = lookupInSymbolEnv (Right (pkgName, sym)) env
-              in assertTyVarUnifies tyVar (ZephyrTyDescStackAtom (StackAtomQuote eff) mempty)
+              in assertTyVarUnifies' tyVar (ZephyrQuoteT eff)
 
 assertSymbol :: [ZephyrTyCheckOp] -> ZephyrTyCheckM s (ZephyrEffect ZephyrTyVar)
 assertSymbol typedOps = do initialZipper <- newTyVar
                            initialStack <- newTyVar
 
-                           assertTyVarUnifies initialZipper =<< ZephyrTyDescZipper <$> (ZipperVar <$> newTyVar) <*> pure mempty
-                           assertTyVarUnifies initialStack =<< ZephyrTyDescStack <$> (StackVar <$> newTyVar) <*> pure mempty
+                           assertTyVarUnifies' initialZipper =<< (zipperVarT <$> newTyVar)
+                           assertTyVarUnifies' initialStack =<< (stackVarT <$> newTyVar)
 
                            let initialState = ZephyrExecState zipper initialStackVar
-                               zipper = ZipperVar initialZipper
-                               initialStackVar = StackVar initialStack
+                               zipper = zipperVarT initialZipper
+                               initialStackVar = stackVarT initialStack
                            ZephyrExecState _ finalStack <- foldlM assertTyCheckOp initialState typedOps
                            return (ZephyrEffect zipper initialStackVar finalStack)
 
@@ -292,133 +276,72 @@ assertTyCheckOp (ZephyrExecState actZipper actBefore) (ZephyrTyCheckCheckEffect 
        pure (ZephyrExecState expZipper after)
 assertTyCheckOp (ZephyrExecState actZipper actBefore) (ZephyrTyCheckCheckSymbol loc symVar) =
     inNestedLocation loc $
-    do afterStk <- StackVar <$> newTyVar
-       assertTyVarUnifies symVar (ZephyrTyDescStackAtom (StackAtomQuote (ZephyrEffect actZipper actBefore afterStk)) mempty)
+    do afterStk <- stackVarT <$> newTyVar
+       assertTyVarUnifies' symVar (ZephyrQuoteT (ZephyrEffect actZipper actBefore afterStk))
        pure (ZephyrExecState actZipper afterStk)
 
 assertState :: ZephyrExecState ZephyrTyVar -> ZephyrExecState ZephyrTyVar -> ZephyrTyCheckM s (ZephyrExecState ZephyrTyVar)
 assertState (ZephyrExecState actualZipper actualStack) (ZephyrExecState expZipper expStack) =
-    ZephyrExecState <$> unifyZipperTy actualZipper expZipper
-                    <*> unifyStackTy actualStack expStack
-
-assertIsStack :: ZephyrTyVar -> ZephyrTyDesc -> ZephyrTyCheckM s (ZephyrStackTy ZephyrTyVar)
-assertIsStack _ (ZephyrTyDescStack s _) = pure s
-assertIsStack _ (ZephyrTyDescFree tyVar _) = pure (StackVar tyVar)
-assertIsStack _ _ = fail "Kind mismatch... Expected stack"
-
-assertIsStackAtom :: ZephyrTyVar -> ZephyrTyDesc -> ZephyrTyCheckM s (ZephyrStackAtomTy ZephyrTyVar)
-assertIsStackAtom _ (ZephyrTyDescStackAtom s _) = pure s
-assertIsStackAtom _ (ZephyrTyDescZipper z _) = pure (StackAtomZipper z)
-assertIsStackAtom _ (ZephyrTyDescFree tyVar _) = pure (StackAtomVar tyVar)
-assertIsStackAtom tyVar (ZephyrTyDescStack stk loc) = do top <- newTyVar
-                                                         below <- newTyVar
-                                                         assertTyVarUnifies tyVar (ZephyrTyDescStack (StackVar below :> StackAtomVar top) mempty)
-                                                         return (StackAtomVar top)
-
-assertIsZipper (ZephyrTyDescZipper s _) = pure s
-                                            -- TODO This should break open a zipper variable
-assertIsZipper (ZephyrTyDescStackAtom s _) = demoteStackAtom s
-assertIsZipper (ZephyrTyDescFree tyVar _) = pure (ZipperVar tyVar)
-assertIsZipper x = fail ("Kind mismatch... Expected zipper atom. Got " ++ show x)
-
-demoteStackAtom :: ZephyrStackAtomTy ZephyrTyVar -> ZephyrTyCheckM s (ZephyrZipperTy ZephyrTyVar)
-demoteStackAtom (StackAtomSimple s) = pure (ZipperConcrete (SimpleFieldT s))
-demoteStackAtom (StackAtomVar v) = pure (ZipperVar v)
-demoteStackAtom x = dieTyCheck [] (InvalidDemotion x)
+    ZephyrExecState <$> unifyZephyrT actualZipper expZipper
+                    <*> unifyZephyrT actualStack expStack
 
 unifyEffect :: ZephyrEffect ZephyrTyVar -> ZephyrEffect ZephyrTyVar -> ZephyrTyCheckM s (ZephyrEffect ZephyrTyVar)
 unifyEffect (ZephyrEffect actZipper actBefore actAfter) (ZephyrEffect expZipper expBefore expAfter) =
-    do zipper <- unifyZipperTy actZipper expZipper
-       before <- unifyStackTy actBefore expBefore
-       after <- unifyStackTy actAfter expAfter
+    do zipper <- unifyZephyrT actZipper expZipper
+       before <- unifyZephyrT actBefore expBefore
+       after <- unifyZephyrT actAfter expAfter
        return (ZephyrEffect zipper before after)
-
-unifyZipperTy :: ZephyrZipperTy ZephyrTyVar -> ZephyrZipperTy ZephyrTyVar -> ZephyrTyCheckM s (ZephyrZipperTy ZephyrTyVar)
-unifyZipperTy (ZipperVar actualVar) (ZipperVar expVar) =
-    assertTyVarEquality actualVar expVar >>=
-    assertIsZipper
-unifyZipperTy (ZipperVar actualVar) exp =
-    assertTyVarUnifies actualVar (ZephyrTyDescZipper exp mempty) >>=
-    assertIsZipper
-unifyZipperTy act (ZipperVar expVar) =
-    assertTyVarUnifies expVar (ZephyrTyDescZipper act mempty) >>=
-    assertIsZipper
-unifyZipperTy (ZipperConcrete act) (ZipperConcrete exp) =
-    ZipperConcrete <$> unifyZipperField act exp
 
 unifyZipperField :: ZippyFieldType (RecZephyrType ZephyrTyVar) -> ZippyFieldType (RecZephyrType ZephyrTyVar) -> ZephyrTyCheckM s (ZippyFieldType (RecZephyrType ZephyrTyVar))
 unifyZipperField (SimpleFieldT act) (SimpleFieldT exp)
     | act == exp = return (SimpleFieldT act)
     | otherwise = fail ("Cannot unify simple types " ++ ppSimpleT act ++ " and " ++ ppSimpleT exp)
 unifyZipperField (RefFieldT (ZippyTyCon actName actArgs)) (RefFieldT (ZippyTyCon expName expArgs))
-    | actName == expName = RefFieldT . ZippyTyCon actName <$> mapM (uncurry unifyZipperTy) (V.zip actArgs expArgs)
+    | actName == expName = RefFieldT . ZippyTyCon actName <$> mapM (uncurry unifyZephyrT) (V.zip actArgs expArgs)
     | otherwise = fail ("Cannot match " ++ ppTyName actName ++ " with " ++ ppTyName expName)
 unifyZipperField act exp =
     fail ("Cannot unify simple and composite types " ++ ppField act ++ " and " ++ ppField exp)
 
-unifyStackTy :: ZephyrStackTy ZephyrTyVar -> ZephyrStackTy ZephyrTyVar -> ZephyrTyCheckM s (ZephyrStackTy ZephyrTyVar)
-unifyStackTy (StackVar actualVar) (StackVar expVar) = assertTyVarEquality actualVar expVar >>=
-                                                      assertIsStack expVar
-unifyStackTy (StackVar actualVar) exp = assertTyVarUnifies actualVar (ZephyrTyDescStack exp mempty) >>=
-                                        assertIsStack actualVar
-unifyStackTy act (StackVar expectedVar) = assertTyVarUnifies expectedVar (ZephyrTyDescStack act mempty) >>=
-                                               assertIsStack expectedVar
-unifyStackTy StackBottom (_ :> _) = fail "Hit stack bottom while typechecking"
-unifyStackTy (_ :> _) StackBottom = fail "Hit stack bottom while typechecking"
-unifyStackTy (actBelow :> actTop) (expBelow :> expTop) = do top <- unifyStackAtomTy actTop expTop
-                                                            below <- unifyStackTy actBelow expBelow
-                                                            return (below :> top)
-
-unifyStackAtomTy :: ZephyrStackAtomTy ZephyrTyVar -> ZephyrStackAtomTy ZephyrTyVar -> ZephyrTyCheckM s (ZephyrStackAtomTy ZephyrTyVar)
-unifyStackAtomTy (StackAtomVar actualVar) (StackAtomVar expVar) = assertTyVarEquality actualVar expVar >>=
-                                                                  assertIsStackAtom expVar
-unifyStackAtomTy (StackAtomVar actualVar) exp = assertTyVarUnifies actualVar (ZephyrTyDescStackAtom exp mempty) >>=
-                                                 assertIsStackAtom actualVar
-unifyStackAtomTy actual (StackAtomVar expVar) = assertTyVarUnifies expVar (ZephyrTyDescStackAtom actual mempty) >>=
-                                                 assertIsStackAtom expVar
-unifyStackAtomTy (StackAtomQuote actualEff) (StackAtomQuote expEff) = StackAtomQuote <$> unifyEffect actualEff expEff
-unifyStackAtomTy (StackAtomZipper actualZipper) (StackAtomZipper expZipper) = StackAtomZipper <$> unifyZipperTy actualZipper expZipper
-unifyStackAtomTy a b
-    | a == b = return a
-    | otherwise = fail ("Cannot unify stack types " ++ ppStackAtomTy a ++ " and " ++ ppStackAtomTy b)
-
-assertTyVarEquality :: ZephyrTyVar -> ZephyrTyVar -> ZephyrTyCheckM s ZephyrTyDesc
+assertTyVarEquality :: IsKind k => ZephyrTyVar -> ZephyrTyVar -> ZephyrTyCheckM s (ZephyrT k ZephyrTyVar)
 assertTyVarEquality act exp =
     increaseIndent $ \indent ->
     do actP <- trace (indent ("Unify vars " ++ ppTyVar act ++ " with " ++ ppTyVar exp)) (getPointForVariable act)
        expP <- getPointForVariable exp
        areEqual <- zephyrST (equivalent actP expP)
-       if areEqual
-         then trace (indent "Done unify vars") (zephyrST (descriptor expP))
-         else do actDesc <- zephyrST (descriptor actP)
-                 expDesc <- zephyrST (descriptor expP)
-                 actExpNonRecursive <- isNonRecursive act expDesc
-                 expActNonRecursive <- isNonRecursive exp actDesc
-                 if actExpNonRecursive && expActNonRecursive
-                    then do newDesc <- trace (indent ("Performing a unify between " ++ ppTyDesc (act, actDesc) ++ " and " ++ ppTyDesc (exp, expDesc))) (unifyTyDesc actDesc expDesc)
-                            zephyrST (union' actP expP (\_ _ -> pure newDesc))
-                            trace (indent "Done unify vars (unified)") (pure newDesc)
-                    else if actExpNonRecursive
-                            then dieOnRecursiveType exp actDesc
-                            else dieOnRecursiveType act expDesc
+       newDesc <- if areEqual
+                  then trace (indent "Done unify vars") (zephyrST (descriptor expP))
+                  else do actDesc <- zephyrST (descriptor actP)
+                          expDesc <- zephyrST (descriptor expP)
+                          actExpNonRecursive <- isNonRecursive act expDesc
+                          expActNonRecursive <- isNonRecursive exp actDesc
+                          if actExpNonRecursive && expActNonRecursive
+                            then do newDesc <- trace (indent ("Performing a unify between " ++ ppTyDesc (act, actDesc) ++ " and " ++ ppTyDesc (exp, expDesc))) (unifyTyDesc actDesc expDesc)
+                                    zephyrST (union' actP expP (\_ _ -> pure newDesc))
+                                    trace (indent "Done unify vars (unified)") $ pure newDesc
+                            else if actExpNonRecursive
+                                 then dieOnRecursiveType exp actDesc
+                                 else dieOnRecursiveType act expDesc
+
+       case newDesc of
+         ZephyrTyDescFree _ var _ -> pure (ZephyrVarT var)
+         ZephyrTyDesc ty _ -> case safeCoercedKind ty of
+                                Nothing -> fail ("Kind mismatch during type var matching. had " ++ show (kindOf ty))
+                                Just t -> pure t
 
 andM :: (Foldable f, Monad m) => (a -> m Bool) -> f a -> m Bool
 andM f x = foldlM doAnd True x
     where doAnd False _ = return False
           doAnd True x = f x
 
-isFree _ (ZephyrTyDescFree _ _) = True
-isFree v (ZephyrTyDescStack (StackVar sv) _) | v == sv = True
-isFree v (ZephyrTyDescZipper (ZipperVar zv) _) | v == zv = True
-isFree v (ZephyrTyDescStackAtom (StackAtomVar sav) _) | v == sav = True
+isFree _ (ZephyrTyDescFree _ _ _) = True
+isFree v (ZephyrTyDesc (ZephyrVarT v') _)
+    | trace ("Check free " ++ show v) (v == v') = True
 isFree _ _ = False
 
 isNonRecursive :: ZephyrTyVar -> ZephyrTyDesc -> ZephyrTyCheckM s Bool
 isNonRecursive v x | trace ("isNonRecursive (" ++ ppTyDesc (v, x) ++ ")") False = undefined
 isNonRecursive v x | isFree v x = return True
-isNonRecursive v (ZephyrTyDescStack s _) = andM (ensureNotVar v) s
-isNonRecursive v (ZephyrTyDescZipper z _) = andM (ensureNotVar v) z
-isNonRecursive v (ZephyrTyDescStackAtom a _) = andM (ensureNotVar v) a
+isNonRecursive v (ZephyrTyDesc s _) = andM (ensureNotVar v) s
 
 ensureNotVar :: ZephyrTyVar -> ZephyrTyVar -> ZephyrTyCheckM s Bool
 ensureNotVar v act = do vP <- getPointForVariable v
@@ -431,8 +354,18 @@ ensureNotVar v act = do vP <- getPointForVariable v
                                       then pure True
                                       else isNonRecursive v actTyDesc
 
-assertTyVarUnifies :: ZephyrTyVar -> ZephyrTyDesc -> ZephyrTyCheckM s ZephyrTyDesc
+withResultKind :: IsKind k => (ZephyrKind -> ZephyrTyCheckM s (ZephyrT k ZephyrTyVar)) -> ZephyrTyCheckM s (ZephyrT k ZephyrTyVar)
+withResultKind f = let res = f (getKind (proxy res))
+                       proxy :: ZephyrTyCheckM s (ZephyrT k ZephyrTyVar) -> Proxy k
+                       proxy _ =  Proxy
+                   in res
+
+assertTyVarUnifies' :: IsKind k => ZephyrTyVar -> ZephyrT k ZephyrTyVar -> ZephyrTyCheckM s (ZephyrT k ZephyrTyVar)
+assertTyVarUnifies' tyVar expTy = assertTyVarUnifies tyVar (ZephyrTyDesc expTy mempty)
+
+assertTyVarUnifies :: IsKind k => ZephyrTyVar -> ZephyrTyDesc -> ZephyrTyCheckM s (ZephyrT k ZephyrTyVar)
 assertTyVarUnifies tyVar expTyDesc =
+    withResultKind $ \kind ->
     increaseIndent $ \indent ->
     do tyVarP <- trace (indent ("Unify " ++ ppTyDesc (tyVar, expTyDesc))) (getPointForVariable tyVar)
        actTyDesc <- zephyrST (descriptor tyVarP)
@@ -440,13 +373,21 @@ assertTyVarUnifies tyVar expTyDesc =
        if nonRecursive
           then do unifiedDesc <- unifyTyDesc actTyDesc expTyDesc
                   trace (indent "Done unifying") (zephyrST (setDescriptor tyVarP unifiedDesc))
-                  return unifiedDesc
+                  case unifiedDesc of
+                    ZephyrTyDesc t loc ->
+                        case safeCoercedKind t of
+                          Nothing -> dieTyCheck loc (ExpectingKind kind (kindOf t))
+                          Just t -> pure t
+                    ZephyrTyDescFree Nothing v _ -> pure (ZephyrVarT v)
+                    ZephyrTyDescFree (Just k) v loc
+                        | k == kind -> pure (ZephyrVarT v)
+                        | otherwise -> dieTyCheck loc (ExpectingKind k kind)
           else dieOnRecursiveType tyVar expTyDesc
 
 dieOnRecursiveType :: ZephyrTyVar -> ZephyrTyDesc -> ZephyrTyCheckM s a
 dieOnRecursiveType tyVar tyDesc = do pt <- getPointForVariable tyVar
                                      tyDesc' <- simplifyTyDesc tyDesc
-                                     fail ("Cannot construct recursive type " ++ ppTyDesc (tyVar, tyDesc'))
+                                     dieTyCheck (descLoc tyDesc (InfinitelyRecursiveType tyVar tyDesc')
 
 increaseIndent :: ((String -> String) -> ZephyrTyCheckM s a) -> ZephyrTyCheckM s a
 increaseIndent a = do indentN <- gets unifyIndent
@@ -455,21 +396,38 @@ increaseIndent a = do indentN <- gets unifyIndent
                       modify (\st -> st { unifyIndent = unifyIndent st - 2 })
                       return r
 
+unifyZephyrT :: IsKind k => ZephyrT k ZephyrTyVar -> ZephyrT k ZephyrTyVar -> ZephyrTyCheckM s (ZephyrT k ZephyrTyVar)
+unifyZephyrT (ZephyrVarT actualVar) (ZephyrVarT expVar) = assertTyVarEquality actualVar expVar
+unifyZephyrT (ZephyrVarT actualVar) exp = assertTyVarUnifies actualVar (ZephyrTyDesc exp mempty)
+unifyZephyrT act (ZephyrVarT expVar) = assertTyVarUnifies expVar (ZephyrTyDesc act mempty)
+unifyZephyrT (ZephyrZipperT act) (ZephyrZipperT exp) = ZephyrZipperT <$> unifyZipperField act exp
+unifyZephyrT ZephyrStackBottomT (_ :> _) = dieTyCheck [] HitStackBottom
+unifyZephyrT (_ :> _) ZephyrStackBottomT = dieTyCheck [] HitStackBottom
+unifyZephyrT (actBelow :> actTop) (expBelow :> expTop) =
+    sameKinded actTop expTop $ \case
+      Just (actTop, expTop) ->
+          do top <- unifyZephyrT actTop expTop
+             below <- unifyZephyrT actBelow expBelow
+             isStackAtomKind top $ \case
+               Just top -> pure (below :> top)
+               Nothing -> trace "die at stack atom coercion" (dieTyCheck [] (KindMismatch actTop expTop))
+      Nothing -> trace "die at stack top coercion" ( dieTyCheck [] (KindMismatch actTop expTop))
+unifyZephyrT (ZephyrQuoteT act) (ZephyrQuoteT exp) = ZephyrQuoteT <$> unifyEffect act exp
+unifyZephyrT act exp = trace "Die at unify" (dieTyCheck [] (KindMismatch act exp))
+
 unifyTyDesc :: ZephyrTyDesc -> ZephyrTyDesc -> ZephyrTyCheckM s ZephyrTyDesc
 unifyTyDesc x y | trace ("unifyTyDesc (" ++ show x ++ ") (" ++ show y ++ ")") False = undefined
-unifyTyDesc (ZephyrTyDescFree _ _) x = pure x
-unifyTyDesc x (ZephyrTyDescFree _ _) = pure x
-unifyTyDesc (ZephyrTyDescZipper actZip actLoc) (ZephyrTyDescZipper expZip expLoc) =
-    ZephyrTyDescZipper <$> unifyZipperTy actZip expZip <*> pure (actLoc ++ expLoc)
-unifyTyDesc (ZephyrTyDescStackAtom (StackAtomZipper actZip) actLoc) (ZephyrTyDescZipper expZip expLoc) =
-    ZephyrTyDescZipper <$> unifyZipperTy actZip expZip <*> pure (actLoc ++ expLoc)
-unifyTyDesc (ZephyrTyDescZipper actZip actLoc) (ZephyrTyDescStackAtom (StackAtomZipper expZip) expLoc) =
-    ZephyrTyDescZipper <$> unifyZipperTy actZip expZip <*> pure (actLoc ++ expLoc)
-unifyTyDesc (ZephyrTyDescStack actStk actLoc) (ZephyrTyDescStack expStk expLoc) =
-    ZephyrTyDescStack <$> unifyStackTy actStk expStk <*> pure (actLoc ++ expLoc)
-unifyTyDesc (ZephyrTyDescStackAtom actStk actLoc) (ZephyrTyDescStackAtom expStk expLoc) =
-    ZephyrTyDescStackAtom <$> unifyStackAtomTy actStk expStk <*> pure (actLoc ++ expLoc)
-unifyTyDesc act exp = dieTyCheck [] (KindMismatch act exp)
+unifyTyDesc f@(ZephyrTyDescFree k _ _) x
+    | descKindsMatch f x = pure x
+    | otherwise = dieTyCheck [] (ExpectingKind (fromJust k) (fromJust $descKind x))
+unifyTyDesc x f@(ZephyrTyDescFree k _ _)
+    | descKindsMatch f x = pure x
+    | otherwise = dieTyCheck [] (ExpectingKind (fromJust k) (fromJust $ descKind x))
+unifyTyDesc (ZephyrTyDesc act actLoc) (ZephyrTyDesc exp expLoc) =
+    sameKinded act exp $ \case
+      Just (act, exp) -> do newTy <- unifyZephyrT act exp
+                            return (ZephyrTyDesc newTy (actLoc <> expLoc))
+      Nothing -> trace "Die at ty desc unify" (dieTyCheck (actLoc <> expLoc) (KindMismatch act exp))
 
 mkTypedZephyrBuilder :: ZephyrTypeLookupEnv -> ZephyrSymbolEnv (ZephyrEffect ZephyrTyVar) -> ZephyrSymbolEnv ZephyrTyVar -> ZephyrBuilder -> ZephyrTyCheckM s [ZephyrTyCheckOp]
 mkTypedZephyrBuilder types pretypedSymbols typedSymbols (ZephyrBuilder ops) = mapM (mkAtomType types pretypedSymbols typedSymbols) (D.toList ops)
@@ -481,22 +439,17 @@ mkAtomType types _ _ (ZephyrStateAssertion s loc) = ZephyrTyCheckCheckState loc'
     where loc' = ZephyrTyErrorLocation (WhileCheckingStateAssertion s . LocatedAt loc)
 
 qualifyState :: ZephyrTypeLookupEnv -> ZephyrExecState v -> ZephyrExecState v
-qualifyState types (ZephyrExecState zipper stack) = ZephyrExecState (qualifyZipper zipper) (qualifyStack stack)
-    where qualifyZipper (ZipperVar v) = ZipperVar v
-          qualifyZipper (ZipperConcrete (SimpleFieldT s)) = ZipperConcrete (SimpleFieldT s)
-          qualifyZipper (ZipperConcrete (RefFieldT (ZippyTyCon tyName tyArgs))) =
-              ZipperConcrete (RefFieldT (ZippyTyCon (qualifyTy tyName types) (fmap qualifyZipper tyArgs)))
-
-          qualifyStack StackBottom = StackBottom
-          qualifyStack (StackVar tyVar) = StackVar tyVar
-          qualifyStack (stk :> atom) = qualifyStack stk :> qualifyStackAtom atom
-
-          qualifyStackAtom (StackAtomSimple s) = StackAtomSimple s
-          qualifyStackAtom (StackAtomQuote eff) = StackAtomQuote (qualifyEffect eff)
-          qualifyStackAtom (StackAtomVar v) = StackAtomVar v
-          qualifyStackAtom (StackAtomZipper z) = StackAtomZipper (qualifyZipper z)
-
-          qualifyEffect (ZephyrEffect zipper stack1 stack2) = ZephyrEffect (qualifyZipper zipper) (qualifyStack stack1) (qualifyStack stack2)
+qualifyState types (ZephyrExecState zipper stack) = ZephyrExecState (qualifyZephyrT zipper) (qualifyZephyrT stack)
+    where qualifyZephyrT :: ZephyrT k v -> ZephyrT k v
+          qualifyZephyrT (ZephyrVarT v) = ZephyrVarT v
+          qualifyZephyrT (ZephyrZipperT (SimpleFieldT s)) = ZephyrZipperT (SimpleFieldT s)
+          qualifyZephyrT (ZephyrZipperT (RefFieldT (ZippyTyCon tyName tyArgs))) =
+              ZephyrZipperT (RefFieldT (ZippyTyCon (qualifyTy tyName types) (fmap qualifyZephyrT tyArgs)))
+          qualifyZephyrT (ZephyrQuoteT (ZephyrEffect zipper stack1 stack2)) = ZephyrQuoteT (ZephyrEffect (qualifyZephyrT zipper)
+                                                                                                         (qualifyZephyrT stack1)
+                                                                                                         (qualifyZephyrT stack2))
+          qualifyZephyrT ZephyrStackBottomT = ZephyrStackBottomT
+          qualifyZephyrT (stk :> atom) = qualifyZephyrT stk :> qualifyZephyrT atom
 
 atomType :: ZephyrTypeLookupEnv -> ZephyrSymbolEnv (ZephyrEffect ZephyrTyVar) -> ZephyrSymbolEnv ZephyrTyVar -> GenericZephyrAtom ZephyrBuilder ZephyrWord -> ZephyrTyCheckM s (Either (ZephyrEffect ZephyrTyVar) ZephyrTyVar)
 atomType _ _ _ (IntegerZ _) = Left <$> instantiate "z | *s -->  *s Integer"
@@ -505,9 +458,9 @@ atomType _ _ _ (FloatingZ _) = Left <$> instantiate "z | *s --> *s Floating"
 atomType _ _ _ (BinaryZ _) = Left <$> instantiate "z | *s --> *s Binary"
 atomType types pretyped syms (QuoteZ q) = do typedQ <- mkTypedZephyrBuilder types pretyped syms q
                                              quoteEffect <- assertSymbol typedQ
-                                             stk <- StackVar <$> newTyVar
-                                             zipper <- ZipperVar <$> newTyVar
-                                             trace ("Find quote " ++ show q ++ " has type " ++ ppEffect quoteEffect) (pure (Left (ZephyrEffect zipper stk (stk :> StackAtomQuote quoteEffect))))
+                                             stk <- stackVarT <$> newTyVar
+                                             zipper <- zipperVarT <$> newTyVar
+                                             trace ("Find quote " ++ show q ++ " has type " ++ ppEffect quoteEffect) (pure (Left (ZephyrEffect zipper stk (stk :> ZephyrQuoteT quoteEffect))))
 atomType _ pretyped syms (SymZ sym) = case lookupInSymbolEnv (Left sym) pretyped of
                                         Nothing -> case lookupInSymbolEnv (Left sym) syms of
                                                      Nothing -> error ("Could not resolve symbol " ++ show sym ++ "\n" ++ show pretyped ++ "\n" ++ show syms)
@@ -544,12 +497,12 @@ ppTyCheckOp (ZephyrTyCheckCheckState _ st) = "Check state: " ++ ppState st
 ppTyCheckOp (ZephyrTyCheckCheckEffect _ eff) = "Check effect: " ++ ppEffect eff
 
 ppState :: ZephyrExecState ZephyrTyVar -> String
-ppState (ZephyrExecState zipper stk) = concat [ ppZipperTy zipper
-                                              , ppStackTy stk ]
+ppState (ZephyrExecState zipper stk) = concat [ ppZephyrTy zipper
+                                              , ppZephyrTy stk ]
 ppEffect :: ZephyrEffect ZephyrTyVar -> String
-ppEffect (ZephyrEffect zipper before after) = concat [ ppZipperTy zipper, " | "
-                                                     , ppStackTy before, " --> "
-                                                     , ppStackTy after ]
+ppEffect (ZephyrEffect zipper before after) = concat [ ppZephyrTy zipper, " | "
+                                                     , ppZephyrTy before, " --> "
+                                                     , ppZephyrTy after ]
 
 ppSimpleT :: ZippySimpleT -> String
 ppSimpleT IntegerT = "Integer"
@@ -557,41 +510,32 @@ ppSimpleT FloatingT = "Floating"
 ppSimpleT TextT = "Text"
 ppSimpleT BinaryT = "Binary"
 
-ppZipperTy :: ZephyrZipperTy ZephyrTyVar -> String
-ppZipperTy (ZipperVar var) = ppTyVar var
-ppZipperTy (ZipperConcrete ty) = ppField ty
-
 ppField :: ZippyFieldType (RecZephyrType ZephyrTyVar) -> String
 ppField (SimpleFieldT s) = ppSimpleT s
-ppField (RefFieldT r) = ppZephyrTy r
+ppField (RefFieldT r) = ppRecZephyrTy r
 
-ppZephyrTy :: RecZephyrType ZephyrTyVar -> String
-ppZephyrTy (ZippyTyCon tyName args)
+ppRecZephyrTy :: RecZephyrType ZephyrTyVar -> String
+ppRecZephyrTy (ZippyTyCon tyName args)
     | V.null args = ppTyName tyName
     | otherwise = concat [ "(", ppTyName tyName, " " ] ++
-                  intercalate " " (map ppZipperTy (V.toList args)) ++
+                  intercalate " " (map ppZephyrTy (V.toList args)) ++
                   ")"
 
-ppStackTy :: ZephyrStackTy ZephyrTyVar -> String
-ppStackTy StackBottom = "0"
-ppStackTy (StackVar var) = ppTyVar var
-ppStackTy (up :> top) = concat [ppStackTy up, " ", ppStackAtomTy top]
-
-ppStackAtomTy :: ZephyrStackAtomTy ZephyrTyVar -> String
-ppStackAtomTy (StackAtomSimple t) = ppSimpleT t
-ppStackAtomTy (StackAtomQuote eff) = concat ["(", ppEffect eff, ")"]
-ppStackAtomTy (StackAtomZipper zip) = ppZipperTy zip
-ppStackAtomTy (StackAtomVar var) = ppTyVar var
+ppZephyrTy :: IsKind k => ZephyrT k ZephyrTyVar -> String
+ppZephyrTy z@(ZephyrVarT v) = case kindOf z of
+                                ZephyrStackK -> "*" <> ppTyVar v
+                                _ -> ppTyVar v
+ppZephyrTy (ZephyrZipperT z) = ppField z
+ppZephyrTy (ZephyrQuoteT eff) = concat ["(", ppEffect eff, ")"]
+ppZephyrTy ZephyrStackBottomT = "0"
+ppZephyrTy (stk :> top) = concat [ppZephyrTy stk, " ", ppZephyrTy top]
 
 ppTyName :: ZippyTyName -> String
 ppTyName (ZippyTyName mod name) = concat [T.unpack mod, ":", T.unpack name]
 
-ppTyDesc (tyVar, desc) = ppTyVar tyVar ++ ": " ++ ppDesc
-    where ppDesc = case desc of
-                     ZephyrTyDescZipper z _ -> ppZipperTy z
-                     ZephyrTyDescStack s _ -> ppStackTy s
-                     ZephyrTyDescStackAtom s _  -> ppStackAtomTy s
-                     ZephyrTyDescFree var _ -> "FREE (" ++ ppTyVar var ++ ")"
+ppTyDesc (tyVar, desc) = ppTyVar tyVar ++ ": " ++ ppDesc desc
+    where ppDesc (ZephyrTyDesc ty locs) = ppZephyrTy ty
+          ppDesc (ZephyrTyDescFree _ var _) = "FREE (" ++ ppTyVar var ++ ")"
 
 instantiate :: ZephyrEffectWithNamedVars -> ZephyrTyCheckM s (ZephyrEffect ZephyrTyVar)
 instantiate (ZephyrEffectWithNamedVars eff) =
