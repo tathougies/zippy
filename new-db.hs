@@ -16,7 +16,10 @@ import System.Environment
 main :: IO ()
 main = do [pkgsPath, rootTyName, roots, db] <- getArgs
           packages <- loadZephyrPackages pkgsPath
-          let (_, schema) = compilePackages packages (ZippyTyName "" (fromString rootTyName))
+          tyCheckedPackages <- case tyCheckPackages packages of
+                                 Right x -> return x
+                                 Left err -> fail ("Error type checking packages:\n" ++ show err)
+          let (_, schema) = compilePackages tyCheckedPackages (ZippyTyName "" (fromString rootTyName))
           withBinaryFile roots AppendMode $ \rootsH ->
               withBinaryFile db ReadWriteMode $ \dbH ->
                   do let def = defaultForSchema schema

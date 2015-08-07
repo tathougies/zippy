@@ -259,6 +259,10 @@ sameKinded z1 z2 f = case safeCoercedKind z2 of
                                         case safeCoercedKind z1 of
                                           Just z1 -> f (Just (z1, zipperKindedZephyrZipper z))
                                           Nothing -> failing
+                                    (ZephyrVarT v, ZephyrBottomK, z2, _) ->
+                                        f (Just (ZephyrVarT v, z2))
+                                    (z1, _, ZephyrVarT v, ZephyrBottomK) ->
+                                        f (Just (z1, ZephyrVarT v))
                                     _ -> failing
     where failing = f (Nothing :: Maybe (ZephyrT ZephyrBottomK tyVar, ZephyrT ZephyrBottomK tyVar))
 
@@ -266,15 +270,21 @@ isStackAtomKind :: IsKind k => ZephyrT k tyVar -> (forall k. (IsKind k, IsStackA
 isStackAtomKind (ty :: ZephyrT k tyVar) next
     | kindOf ty == ZephyrStackAtomK = next (Just (unsafeCoerce ty :: ZephyrT ZephyrStackAtomK tyVar))
     | kindOf ty == ZephyrZipperK = next (Just (unsafeCoerce ty :: ZephyrT ZephyrZipperK tyVar))
+    | kindOf ty == ZephyrBottomK = case ty of
+                                     ZephyrVarT v -> next (Just (ZephyrVarT v :: ZephyrT ZephyrStackAtomK tyVar))
+                                     _ -> error "encountered bottom kind, but this variable is not free"
     | otherwise = next (Nothing :: Maybe (ZephyrT ZephyrBottomK tyVar))
 
 safeCoercedKind :: (IsKind k1, IsKind k2) => ZephyrT k1 tyVar -> Maybe (ZephyrT k2 tyVar)
-safeCoercedKind z
+safeCoercedKind (z :: ZephyrT k1 tyVar)
     | kindOf ret == kindOf z = Just ret
     | otherwise = case (z, kindOf z, kindOf ret) of
                     (ZephyrVarT z, ZephyrZipperK, ZephyrStackAtomK) -> Just (ZephyrVarT z)
                     (ZephyrZipperT z, ZephyrZipperK, ZephyrStackAtomK) -> Just (unsafeCoerce (stackAtomKindedZephyrZipper z))
                     (ZephyrZipperT z, ZephyrStackAtomK, ZephyrZipperK) -> Just (unsafeCoerce (zipperKindedZephyrZipper z))
+                    (ZephyrVarT v, ZephyrBottomK, ZephyrStackAtomK) -> Just (unsafeCoerce (ZephyrVarT v :: ZephyrT ZephyrStackAtomK tyVar))
+                    (ZephyrVarT v, ZephyrBottomK, ZephyrStackK) -> Just (unsafeCoerce (ZephyrVarT v :: ZephyrT ZephyrStackK tyVar))
+                    (ZephyrVarT v, ZephyrBottomK, ZephyrZipperK) -> Just (unsafeCoerce (ZephyrVarT v :: ZephyrT ZephyrZipperK tyVar))
                     _ -> trace ("Cannot coerce " ++ show (kindOf z) ++ " " ++ show (kindOf ret)) Nothing
     where ret = unsafeCoerce z
 

@@ -46,22 +46,19 @@ instance Show ZephyrTyErrorLocation where
 
 data ZephyrTyDesc where
     ZephyrTyDesc :: IsKind k => ZephyrT k ZephyrTyVar -> [ZephyrTyCheckLocation] -> ZephyrTyDesc
-    ZephyrTyDescFree :: Maybe ZephyrKind -> ZephyrTyVar -> [ZephyrTyCheckLocation]-> ZephyrTyDesc
 deriving instance Show ZephyrTyDesc
 
-descKind :: ZephyrTyDesc -> Maybe ZephyrKind
-descKind (ZephyrTyDescFree k _ _) = k
-descKind (ZephyrTyDesc z _) = Just $ kindOf z
+descKind :: ZephyrTyDesc -> ZephyrKind
+descKind (ZephyrTyDesc z _) = kindOf z
 
 descKindsMatch :: ZephyrTyDesc -> ZephyrTyDesc -> Bool
 descKindsMatch a b = case (descKind a, descKind b) of
-                       (Nothing, _) -> True
-                       (_, Nothing) -> True
-                       (Just a, Just b) -> a == b
+                       (ZephyrBottomK, _) -> True
+                       (_, ZephyrBottomK) -> True
+                       (a, b) -> a == b
 
 descLoc :: ZephyrTyDesc -> [ZephyrTyCheckLocation]
 descLoc (ZephyrTyDesc _ loc) = loc
-descLoc (ZephyrTyDescFree _ _ loc) = loc
 
 data ZephyrTyCheckOp = ZephyrTyCheckCheckState !ZephyrTyErrorLocation !(ZephyrExecState ZephyrTyVar)
                      | ZephyrTyCheckCheckEffect !ZephyrTyErrorLocation !(ZephyrEffect ZephyrTyVar)
@@ -111,7 +108,6 @@ instance MonadState (ZephyrTyCheckState s) (ZephyrTyCheckM s) where
     put s = ZephyrTyCheckM $ \_ _ -> pure (Right (), s)
 
 tyDescLoc :: ZephyrTyDesc -> [ZephyrTyCheckLocation]
-tyDescLoc (ZephyrTyDescFree _ _ loc) = loc
 tyDescLoc (ZephyrTyDesc _ loc) = loc
 
 dieTyCheck :: [ZephyrTyCheckLocation] -> ZephyrTyCheckError -> ZephyrTyCheckM s a
@@ -163,7 +159,7 @@ getPointForVariable tyVar =
        tyVarPoint <- zephyrST (HT.lookup tyVars tyVar)
        case tyVarPoint of
          Nothing -> zephyrST $
-                    do newPoint <- fresh (ZephyrTyDescFree Nothing tyVar mempty)
+                    do newPoint <- fresh (ZephyrTyDesc (ZephyrVarT tyVar :: ZephyrT ZephyrBottomK ZephyrTyVar) mempty)
                        HT.insert tyVars tyVar newPoint
                        return newPoint
          Just tyVarPoint -> return tyVarPoint
@@ -216,7 +212,6 @@ tyCheckPackages pretypedSymbols types pkgs = tyCheck
 type TyCheckEndoM s x = x -> ZephyrTyCheckM s x
 
 simplifyTyDesc :: TyCheckEndoM s ZephyrTyDesc
-simplifyTyDesc (ZephyrTyDescFree k v loc) = pure (ZephyrTyDescFree k v loc)
 simplifyTyDesc (ZephyrTyDesc z loc) = ZephyrTyDesc <$> simplifyZephyrT z <*> pure loc
 
 simplifyEffect :: TyCheckEndoM s (ZephyrEffect ZephyrTyVar)
@@ -234,7 +229,6 @@ simplifyZephyrT (st :> top) = ((:>) <$> simplifyZephyrT st <*> simplifyZephyrT t
 simplifyZephyrT (ZephyrVarT tyVar) =
     do tyDesc <- zephyrST . descriptor =<< getPointForVariable tyVar
        case tyDesc of
-         ZephyrTyDescFree _ tyVar _ -> pure (ZephyrVarT tyVar)
          ZephyrTyDesc (ZephyrVarT v) _
              | v == tyVar -> pure (ZephyrVarT v)
          ZephyrTyDesc ty _ -> case safeCoercedKind ty of
@@ -323,7 +317,6 @@ assertTyVarEquality act exp =
                                  else dieOnRecursiveType act expDesc
 
        case newDesc of
-         ZephyrTyDescFree _ var _ -> pure (ZephyrVarT var)
          ZephyrTyDesc ty _ -> case safeCoercedKind ty of
                                 Nothing -> fail ("Kind mismatch during type var matching. had " ++ show (kindOf ty))
                                 Just t -> pure t
@@ -333,9 +326,8 @@ andM f x = foldlM doAnd True x
     where doAnd False _ = return False
           doAnd True x = f x
 
-isFree _ (ZephyrTyDescFree _ _ _) = True
 isFree v (ZephyrTyDesc (ZephyrVarT v') _)
-    | trace ("Check free " ++ show v) (v == v') = True
+    | trace ("Check free " ++ show v ++ " " ++ show v') (v == v') = True
 isFree _ _ = False
 
 isNonRecursive :: ZephyrTyVar -> ZephyrTyDesc -> ZephyrTyCheckM s Bool
@@ -378,16 +370,12 @@ assertTyVarUnifies tyVar expTyDesc =
                         case safeCoercedKind t of
                           Nothing -> dieTyCheck loc (ExpectingKind kind (kindOf t))
                           Just t -> pure t
-                    ZephyrTyDescFree Nothing v _ -> pure (ZephyrVarT v)
-                    ZephyrTyDescFree (Just k) v loc
-                        | k == kind -> pure (ZephyrVarT v)
-                        | otherwise -> dieTyCheck loc (ExpectingKind k kind)
           else dieOnRecursiveType tyVar expTyDesc
 
 dieOnRecursiveType :: ZephyrTyVar -> ZephyrTyDesc -> ZephyrTyCheckM s a
 dieOnRecursiveType tyVar tyDesc = do pt <- getPointForVariable tyVar
                                      tyDesc' <- simplifyTyDesc tyDesc
-                                     dieTyCheck (descLoc tyDesc (InfinitelyRecursiveType tyVar tyDesc')
+                                     dieTyCheck (descLoc tyDesc) (InfinitelyRecursiveType tyVar tyDesc')
 
 increaseIndent :: ((String -> String) -> ZephyrTyCheckM s a) -> ZephyrTyCheckM s a
 increaseIndent a = do indentN <- gets unifyIndent
@@ -417,12 +405,14 @@ unifyZephyrT act exp = trace "Die at unify" (dieTyCheck [] (KindMismatch act exp
 
 unifyTyDesc :: ZephyrTyDesc -> ZephyrTyDesc -> ZephyrTyCheckM s ZephyrTyDesc
 unifyTyDesc x y | trace ("unifyTyDesc (" ++ show x ++ ") (" ++ show y ++ ")") False = undefined
-unifyTyDesc f@(ZephyrTyDescFree k _ _) x
-    | descKindsMatch f x = pure x
-    | otherwise = dieTyCheck [] (ExpectingKind (fromJust k) (fromJust $descKind x))
-unifyTyDesc x f@(ZephyrTyDescFree k _ _)
-    | descKindsMatch f x = pure x
-    | otherwise = dieTyCheck [] (ExpectingKind (fromJust k) (fromJust $ descKind x))
+unifyTyDesc (ZephyrTyDesc act@(ZephyrVarT _) actLoc) expDesc@(ZephyrTyDesc exp expLoc) =
+    sameKinded act exp $ \case
+      Just (act, exp) -> pure expDesc
+      Nothing -> dieTyCheck (actLoc <> expLoc) (KindMismatch act exp)
+unifyTyDesc actDesc@(ZephyrTyDesc act actLoc) (ZephyrTyDesc exp@(ZephyrVarT _) expLoc) =
+    sameKinded act exp $ \case
+      Just (act, exp) -> pure actDesc
+      Nothing -> dieTyCheck (actLoc <> expLoc) (KindMismatch act exp)
 unifyTyDesc (ZephyrTyDesc act actLoc) (ZephyrTyDesc exp expLoc) =
     sameKinded act exp $ \case
       Just (act, exp) -> do newTy <- unifyZephyrT act exp
@@ -535,7 +525,6 @@ ppTyName (ZippyTyName mod name) = concat [T.unpack mod, ":", T.unpack name]
 
 ppTyDesc (tyVar, desc) = ppTyVar tyVar ++ ": " ++ ppDesc desc
     where ppDesc (ZephyrTyDesc ty locs) = ppZephyrTy ty
-          ppDesc (ZephyrTyDescFree _ var _) = "FREE (" ++ ppTyVar var ++ ")"
 
 instantiate :: ZephyrEffectWithNamedVars -> ZephyrTyCheckM s (ZephyrEffect ZephyrTyVar)
 instantiate (ZephyrEffectWithNamedVars eff) =
