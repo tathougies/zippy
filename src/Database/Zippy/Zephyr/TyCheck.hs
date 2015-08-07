@@ -32,7 +32,7 @@ data ZephyrTyCheckState s = ZephyrTyCheckState
 
                           , tyCheckTyVars :: HT.HashTable s ZephyrTyVar (Point s ZephyrTyDesc)
 
-                          , unifyIndent :: Int}
+                          , unifyIndent :: Int }
 
 newtype ZephyrTyErrorLocation = ZephyrTyErrorLocation (ZephyrTyCheckLocation -> ZephyrTyCheckLocation)
 
@@ -49,9 +49,9 @@ data ZephyrTyDesc = ZephyrTyDescStack (ZephyrStackTy ZephyrTyVar) [ZephyrTyCheck
                   | ZephyrTyDescFree ZephyrTyVar [ZephyrTyCheckLocation]
                     deriving Show
 
-data ZephyrTyCheckOp = ZephyrTyCheckCheckState !(ZephyrExecState ZephyrTyVar)
-                     | ZephyrTyCheckCheckEffect !(ZephyrEffect ZephyrTyVar)
-                     | ZephyrTyCheckCheckSymbol !ZephyrTyVar
+data ZephyrTyCheckOp = ZephyrTyCheckCheckState !ZephyrTyErrorLocation !(ZephyrExecState ZephyrTyVar)
+                     | ZephyrTyCheckCheckEffect !ZephyrTyErrorLocation !(ZephyrEffect ZephyrTyVar)
+                     | ZephyrTyCheckCheckSymbol !ZephyrTyErrorLocation !ZephyrTyVar
                        deriving Show
 
 data ZephyrTyCheckError = InfinitelyRecursiveType !ZephyrTyVar !ZephyrTyDesc
@@ -64,32 +64,36 @@ data ZephyrTyCheckError = InfinitelyRecursiveType !ZephyrTyVar !ZephyrTyDesc
                         | GenericFail !String
                           deriving Show
 data ZephyrTyCheckLocation = LocatedAt !SourceRange !ZephyrTyCheckLocation
+                           | WhileCheckingAtom !(GenericZephyrAtom ZephyrBuilder ZephyrWord) !ZephyrTyCheckLocation
+                           | WhileCheckingStateAssertion !(ZephyrExecState ZippyTyVarName) !ZephyrTyCheckLocation
                            | Here
                              deriving Show
 
-newtype ZephyrTyCheckM s a = ZephyrTyCheckM { runZephyrTyCheckM :: ZephyrTyCheckState s -> ST s (Either ([ZephyrTyCheckLocation], ZephyrTyCheckError) a, ZephyrTyCheckState s) }
+newtype ZephyrTyCheckM s a = ZephyrTyCheckM { runZephyrTyCheckM :: ZephyrTyErrorLocation ->
+                                                                   ZephyrTyCheckState s ->
+                                                                   ST s (Either ([ZephyrTyCheckLocation], ZephyrTyCheckError) a, ZephyrTyCheckState s) }
 -- type ZephyrTyCheckM s = StateT (ZephyrTyCheckState s) (ST s)
 
 instance Monad (ZephyrTyCheckM s) where
     return = pure
-    a >>= b = ZephyrTyCheckM $ \s -> do (x, s') <- runZephyrTyCheckM a s
-                                        case x of
-                                          Left err -> pure (Left err, s')
-                                          Right x  -> runZephyrTyCheckM (b x) s'
+    a >>= b = ZephyrTyCheckM $ \loc s -> do (x, s') <- runZephyrTyCheckM a loc s
+                                            case x of
+                                              Left err -> pure (Left err, s')
+                                              Right x  -> runZephyrTyCheckM (b x) loc s'
     fail x = dieTyCheck [] (GenericFail x)
 
 instance Functor (ZephyrTyCheckM s) where
     fmap f a = pure . f =<< a
 
 instance Applicative (ZephyrTyCheckM s) where
-    pure x = ZephyrTyCheckM $ \s -> pure (Right x, s)
+    pure x = ZephyrTyCheckM $ \_ s -> pure (Right x, s)
     f <*> x = do f' <- f
                  x' <- x
                  pure (f' x')
 
 instance MonadState (ZephyrTyCheckState s) (ZephyrTyCheckM s) where
-    get = ZephyrTyCheckM $ \s -> pure (Right s, s)
-    put s = ZephyrTyCheckM $ \_ -> pure (Right (), s)
+    get = ZephyrTyCheckM $ \_ s -> pure (Right s, s)
+    put s = ZephyrTyCheckM $ \_ _ -> pure (Right (), s)
 
 tyDescLoc :: ZephyrTyDesc -> [ZephyrTyCheckLocation]
 tyDescLoc (ZephyrTyDescFree _ loc) = loc
@@ -98,21 +102,21 @@ tyDescLoc (ZephyrTyDescStackAtom _ loc) = loc
 tyDescLoc (ZephyrTyDescZipper _ loc) = loc
 
 dieTyCheck :: [ZephyrTyCheckLocation] -> ZephyrTyCheckError -> ZephyrTyCheckM s a
-dieTyCheck otherLocs err = ZephyrTyCheckM $ \s -> pure (Left (otherLocs, err), s)
+dieTyCheck otherLocs err = ZephyrTyCheckM $ \(ZephyrTyErrorLocation loc) s -> pure (Left (loc Here:otherLocs, err), s)
 
 catchTyCheck :: ZephyrTyCheckM s a -> (ZephyrTyCheckError -> ZephyrTyCheckM s a) -> ZephyrTyCheckM s a
 catchTyCheck action onExc =
-    ZephyrTyCheckM $ \s ->
-    do (res, s') <- runZephyrTyCheckM action s
+    ZephyrTyCheckM $ \loc s ->
+    do (res, s') <- runZephyrTyCheckM action loc s
        case res of
-         Left (locs, err) -> do (res', s'') <- runZephyrTyCheckM (onExc err) s'
+         Left (locs, err) -> do (res', s'') <- runZephyrTyCheckM (onExc err) loc s'
                                 case res' of
                                   Left (locs', err') -> pure (Left (locs ++ locs', err'), s'')
                                   Right res -> pure (Right res, s'')
          Right res -> pure (Right res, s')
 
 zephyrST :: ST s a -> ZephyrTyCheckM s a
-zephyrST action = ZephyrTyCheckM $ \s ->
+zephyrST action = ZephyrTyCheckM $ \loc s ->
                   do res <- action
                      pure (Right res, s)
 
@@ -123,8 +127,12 @@ certifyPackage pkg = fmap unwrapBuilder pkg
 runInNewTyCheckM :: (forall s. ZephyrTyCheckM s x) -> Either ([ZephyrTyCheckLocation], ZephyrTyCheckError) x
 runInNewTyCheckM f = runST $
                      do st <- newTyCheckState
-                        (res, _) <- runZephyrTyCheckM f st
+                        (res, _) <- runZephyrTyCheckM f mempty st
                         return res
+
+inNestedLocation :: ZephyrTyErrorLocation -> ZephyrTyCheckM s a -> ZephyrTyCheckM s a
+inNestedLocation nestedLoc action =
+    ZephyrTyCheckM $ \loc s -> runZephyrTyCheckM action (loc <> nestedLoc) s
 
 -- simpleTyCheckPackages :: ZephyrTypeLookupEnv -> [ZephyrPackage] -> [ZephyrTyCheckedPackage]
 -- simpleTyCheckPackages types pkgs = runST (newTyCheckState >>= evalStateT (tyCheckPackages types pkgs))
@@ -274,13 +282,16 @@ assertSymbol typedOps = do initialZipper <- newTyVar
                            return (ZephyrEffect zipper initialStackVar finalStack)
 
 assertTyCheckOp :: ZephyrExecState ZephyrTyVar -> ZephyrTyCheckOp -> ZephyrTyCheckM s (ZephyrExecState ZephyrTyVar)
-assertTyCheckOp actNow (ZephyrTyCheckCheckState expNow) =
+assertTyCheckOp actNow (ZephyrTyCheckCheckState loc expNow) =
+    inNestedLocation loc $
     do assertState actNow expNow
        pure expNow
-assertTyCheckOp (ZephyrExecState actZipper actBefore) (ZephyrTyCheckCheckEffect (ZephyrEffect expZipper expBefore after)) =
+assertTyCheckOp (ZephyrExecState actZipper actBefore) (ZephyrTyCheckCheckEffect loc (ZephyrEffect expZipper expBefore after)) =
+    inNestedLocation loc $
     do assertState (ZephyrExecState actZipper actBefore) (ZephyrExecState expZipper expBefore)
        pure (ZephyrExecState expZipper after)
-assertTyCheckOp (ZephyrExecState actZipper actBefore) (ZephyrTyCheckCheckSymbol symVar) =
+assertTyCheckOp (ZephyrExecState actZipper actBefore) (ZephyrTyCheckCheckSymbol loc symVar) =
+    inNestedLocation loc $
     do afterStk <- StackVar <$> newTyVar
        assertTyVarUnifies symVar (ZephyrTyDescStackAtom (StackAtomQuote (ZephyrEffect actZipper actBefore afterStk)) mempty)
        pure (ZephyrExecState actZipper afterStk)
@@ -464,8 +475,10 @@ mkTypedZephyrBuilder :: ZephyrTypeLookupEnv -> ZephyrSymbolEnv (ZephyrEffect Zep
 mkTypedZephyrBuilder types pretypedSymbols typedSymbols (ZephyrBuilder ops) = mapM (mkAtomType types pretypedSymbols typedSymbols) (D.toList ops)
 
 mkAtomType :: ZephyrTypeLookupEnv -> ZephyrSymbolEnv (ZephyrEffect ZephyrTyVar) -> ZephyrSymbolEnv ZephyrTyVar -> ZephyrBuilderOp -> ZephyrTyCheckM s ZephyrTyCheckOp
-mkAtomType types pretypedSymbols typedSymbols (ZephyrAtom a _) = either ZephyrTyCheckCheckEffect ZephyrTyCheckCheckSymbol <$> atomType types pretypedSymbols typedSymbols a
-mkAtomType types _ _ (ZephyrStateAssertion s _) = ZephyrTyCheckCheckState <$> instantiateState (qualifyState types s)
+mkAtomType types pretypedSymbols typedSymbols (ZephyrAtom a loc) = either (ZephyrTyCheckCheckEffect locAtom) (ZephyrTyCheckCheckSymbol locAtom) <$> atomType types pretypedSymbols typedSymbols a
+    where locAtom = ZephyrTyErrorLocation (WhileCheckingAtom a . LocatedAt loc)
+mkAtomType types _ _ (ZephyrStateAssertion s loc) = ZephyrTyCheckCheckState loc' <$> instantiateState (qualifyState types s)
+    where loc' = ZephyrTyErrorLocation (WhileCheckingStateAssertion s . LocatedAt loc)
 
 qualifyState :: ZephyrTypeLookupEnv -> ZephyrExecState v -> ZephyrExecState v
 qualifyState types (ZephyrExecState zipper stack) = ZephyrExecState (qualifyZipper zipper) (qualifyStack stack)
@@ -527,8 +540,8 @@ ppTyVar :: ZephyrTyVar -> String
 ppTyVar (ZephyrTyVar i) = 'v':show i
 
 ppTyCheckOp :: ZephyrTyCheckOp -> String
-ppTyCheckOp (ZephyrTyCheckCheckState st) = "Check state: " ++ ppState st
-ppTyCheckOp (ZephyrTyCheckCheckEffect eff) = "Check effect: " ++ ppEffect eff
+ppTyCheckOp (ZephyrTyCheckCheckState _ st) = "Check state: " ++ ppState st
+ppTyCheckOp (ZephyrTyCheckCheckEffect _ eff) = "Check effect: " ++ ppEffect eff
 
 ppState :: ZephyrExecState ZephyrTyVar -> String
 ppState (ZephyrExecState zipper stk) = concat [ ppZipperTy zipper
