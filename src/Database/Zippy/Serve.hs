@@ -77,9 +77,11 @@ data ServeCmd = MoveUpCmd
               | CommitCmd
               | FindInTreapCmd !Int64
               | InsertInTreapCmd !Int64 !Text
-              | ZephyrQueryCmd !Text !ByteString
+              | ZephyrQueryCmd !Bool !Text !ByteString
               | ListZephyrCmds
               | NewTxnCmd
+
+              | CurTyCmd
                 deriving (Show)
 
 type ServeM = IO
@@ -101,6 +103,7 @@ commitAndWaitForStatus txnsChan txnId =
 
 cmdP :: ZippySchema -> ZippyT -> Parser ServeCmd
 cmdP sch curTy = {-# SCC cmdP #-}
+                 (pure CurTyCmd <* string "ty") <|>
                  (pure MoveUpCmd <* string "up") <|>
                  (MoveDownCmd <$> (string "down " *> decimal)) <|>
                  (ReplaceCmd <$> (string "replace" *> spaces *> Atto.takeWhile (const True))) <|>
@@ -109,7 +112,8 @@ cmdP sch curTy = {-# SCC cmdP #-}
                  (pure CurCmd <* string "cur") <|>
                  (pure CommitCmd <* string "commit") <|>
                  (pure ListZephyrCmds <* string "list-queries") <|>
-                 (ZephyrQueryCmd . TE.decodeUtf8  <$> (string "query" *> spaces *> Atto.takeWhile1 (not . isSpace . chr . fromIntegral)) <*> (spaces *> Atto.takeWhile (const True))) <|>
+                 (ZephyrQueryCmd False . TE.decodeUtf8  <$> (string "query" *> spaces *> Atto.takeWhile1 (not . isSpace . chr . fromIntegral)) <*> (spaces *> Atto.takeWhile (const True))) <|>
+                 (ZephyrQueryCmd True . TE.decodeUtf8  <$> (string "txquery" *> spaces *> Atto.takeWhile1 (not . isSpace . chr . fromIntegral)) <*> (spaces *> Atto.takeWhile (const True))) <|>
                  (pure NewTxnCmd <* string "begin")
                  <?> "Zippy command"
 
@@ -138,6 +142,8 @@ requestServer txnsChan txnId nextTxnId exportedZephyr sch curTy =
         case parseOnly (cmdP sch curTy) cmd of
           Left err -> yield (fromString ("Cannot parse this cmd: " ++ show err ++ "\n")) >>
                       continueWithType curTy
+          Right CurTyCmd -> do yield (fromString (show curTy))
+                               continueWithType curTy
           Right MoveUpCmd -> do res <- lift $ interpretTxAsync sch ResyncAfterTx txnsChan simpleTxActionLogger txnId (move Up)
                                 let (res', newTy) = case res of
                                                       Moved newTy -> ("Moved\n", newTy)
@@ -156,7 +162,7 @@ requestServer txnsChan txnId nextTxnId exportedZephyr sch curTy =
                              continueWithType curTy
           Right (ReplaceCmd d) ->
               case Parsec.parse (parseZippyD curTy sch) "<network>" d of
-                Left err -> yield ("Could not parse data of type " <> fromString (show curTy)) >>
+                Left err -> yield ("Could not parse data of type " <> fromString (show curTy) <> "\n") >>
                             continueWithType curTy
                 Right d -> do liftIO $ infoM "serveRequest" ("Replace with " ++ show d)
                               res <- lift $ interpretTxAsync sch ResyncAfterTx txnsChan simpleTxActionLogger txnId (move (Replace d))
@@ -182,7 +188,7 @@ requestServer txnsChan txnId nextTxnId exportedZephyr sch curTy =
               do let keys = map (\(ZephyrWord t) -> TE.encodeUtf8 t) (HM.keys exportedZephyr)
                  yield ("QUERIES " <> BS.intercalate " " keys <> "\n")
                  continueWithType curTy
-          Right (ZephyrQueryCmd cmdName stk) ->
+          Right (ZephyrQueryCmd commitAfter cmdName stk) ->
               do liftIO $ infoM "serveRequest" "testing zephyr"
                  case parseZephyrStack stk of
                    Left err -> yield (fromString ("error parsing stack: " ++ show err ++ "\n")) >>
@@ -193,8 +199,14 @@ requestServer txnsChan txnId nextTxnId exportedZephyr sch curTy =
                                                wireLogChan <- liftIO newChan
                                                resV <- liftIO newEmptyMVar
 
-                                               liftIO (forkIO (interpretTxAsync sch ResyncAfterTx txnsChan (txResultActionLogger rawLogChan) txnId (runZephyr zephyrProg sch stk) >>= \res ->
-                                                               writeChan rawLogChan Nothing >> putMVar resV res))
+                                               liftIO . forkIO $ do
+                                                 res <- interpretTxAsync sch (if commitAfter then DontResyncAfterTx else ResyncAfterTx) txnsChan (txResultActionLogger rawLogChan) txnId $
+                                                        do res <- runZephyr zephyrProg sch (reverse stk)
+                                                           commitRes <- if commitAfter then Just <$> commit else pure Nothing
+                                                           return (res, commitRes)
+                                                 writeChan rawLogChan Nothing
+                                                 putMVar resV res
+
                                                liftIO (forkIO (buildWireBuilders curTy sch txnId txnsChan rawLogChan wireLogChan))
 
                                                let getBuilders = do res <- liftIO (readChan wireLogChan)
@@ -208,13 +220,16 @@ requestServer txnsChan txnId nextTxnId exportedZephyr sch curTy =
                                                                  Just x -> lift (yield x) >> liftYield
 
                                                getBuilders $= CL.map (\x -> byteString "RES " <> x <> byteString "\n") $= builderToByteString $$ liftYield
-                                               res <- liftIO (takeMVar resV)
+                                               (res, commitRes) <- liftIO (takeMVar resV)
                                                yield ("ALL DONE" <> fromString (show res) <> "\n")
+                                               case commitRes of
+                                                 Nothing -> pure ()
+                                                 Just commitRes -> yield (fromString (show commitRes <> "\n"))
                                                continueWithType curTy
                          Nothing -> yield (fromString ("No such zephyr query: " ++ show cmdName ++ "\n")) >>
                                     continueWithType curTy
 
-    where continueWithType curTy' = requestServer txnsChan txnId nextTxnId exportedZephyr sch curTy
+    where continueWithType curTy' = requestServer txnsChan txnId nextTxnId exportedZephyr sch curTy'
 
 buildWireBuilders :: ZippyT -> ZippySchema -> TxnId -> TxnStepsChan -> Chan (Maybe Zipper) -> Chan (Maybe Builder) -> IO ()
 buildWireBuilders curTy sch txnId txnsChan zChan builderChan = emptyAsyncDiskState txnsChan txnId >>=
@@ -280,19 +295,27 @@ serveZippy (ZippyServeSettings { .. }) =
                           return ret
 
        zephyrPackages <- loadZephyrPackages zephyrPackageDirectory
-       let (exports, schema) = compilePackages zephyrPackages (ZippyTyCon zephyrRootTyName mempty)
+       case compilePackages zephyrPackages (ZippyTyCon zephyrRootTyName mempty) of
+         Left (ZephyrCompileErrorTy err) ->
+             let showError (locs, err) = "At " ++ show locs ++ ":\n" ++ showError' err
+                 showError' (KindMismatch ty1 ty2) = "Kind mismatch between " ++ show (kindOf ty1) ++ " and " ++ show (kindOf ty2) ++ " " ++ show ty1 ++ " " ++ show ty2
+                 showError' x = show x
+             in putStrLn (showError err)
+         Left (ZephyrCompileErrorGeneric err) ->
+             putStrLn ("Generic compile error: " ++ err)
+         Right (exports, schema) ->
+             do infoM "serveZippy" ("Loaded packages " ++ show (map zephyrPackageName zephyrPackages))
 
-       infoM "serveZippy" ("Loaded packages " ++ show (map zephyrPackageName zephyrPackages))
+                let st = ZippyState txns rootsPtr diskStateRef schema
 
-       let st = ZippyState txns rootsPtr diskStateRef schema
+                -- Start transaction server
+                infoM "serveZippy" ("Schema is " ++ show schema)
+                infoM "serveZippy" "Starting transaction coordinator thread..."
+                forkIO (txnServe stepsChan st)
 
-       -- Start transaction server
-       infoM "serveZippy" "Starting transaction coordinator thread..."
-       forkIO (txnServe stepsChan st)
-
-       -- Start network server
-       listen serverAddress (show serverPort) $ \(sock, listenAddr) ->
-           do infoM "serveZippy" ("Starting server on " ++ show listenAddr)
-              forever $ do
-                info@(clientSock, _) <- accept sock
-                forkIO (serveClient stepsChan nextTxnId exports schema info `E.finally` close clientSock)
+                -- Start network server
+                listen serverAddress (show serverPort) $ \(sock, listenAddr) ->
+                    do infoM "serveZippy" ("Starting server on " ++ show listenAddr)
+                       forever $ do
+                         info@(clientSock, _) <- accept sock
+                         forkIO (serveClient stepsChan nextTxnId exports schema info `E.finally` close clientSock)

@@ -9,31 +9,38 @@ import Database.Zippy.Types
 import Prelude hiding (mapM)
 
 import Control.Applicative
+import Control.Arrow
 import Control.Monad.ST
 import Control.Monad.State hiding (mapM)
 
 import Data.Proxy
 import Data.STRef
 import Data.Traversable (mapM)
-import Data.Foldable (Foldable, foldlM)
+import Data.Foldable (Foldable, foldlM, foldrM)
 import Data.List (intercalate)
 import Data.Monoid
 import Data.Maybe
 import Data.UnionFind.ST
+import qualified Data.Set as S
 import qualified Data.Text as T
 import qualified Data.Vector as V
 import qualified Data.DList as D
 import qualified Data.HashMap.Strict as HM
 import qualified Data.HashTable.ST.Basic as HT
+import qualified Data.HashTable.Class as HTC
 
 import Debug.Trace
 
 data ZephyrTyCheckState s = ZephyrTyCheckState
                           { nextVar :: ST s ZephyrTyVar
+                          , allocVar :: ZephyrTyVar -> ST s ()
 
                           , tyCheckTyVars :: HT.HashTable s ZephyrTyVar (Point s ZephyrTyDesc)
+                          , tyCheckInstances :: [(ZephyrTyVar, ZephyrTyDesc)]
 
                           , unifyIndent :: Int }
+
+type DetailedTyCheckedPackage = GenericZephyrPackage (ZephyrT ZephyrStackAtomK ZephyrTyVar, [ZephyrOpComment], [ZephyrTyCheckOp], ZephyrTyChecked)
 
 newtype ZephyrTyErrorLocation = ZephyrTyErrorLocation (ZephyrTyCheckLocation -> ZephyrTyCheckLocation)
 
@@ -62,8 +69,23 @@ descLoc (ZephyrTyDesc _ loc) = loc
 
 data ZephyrTyCheckOp = ZephyrTyCheckCheckState !ZephyrTyErrorLocation !(ZephyrExecState ZephyrTyVar)
                      | ZephyrTyCheckCheckEffect !ZephyrTyErrorLocation !(ZephyrEffect ZephyrTyVar)
-                     | ZephyrTyCheckCheckSymbol !ZephyrTyErrorLocation !ZephyrTyVar
+                     | ZephyrTyCheckCheckQuote !ZephyrTyErrorLocation !(ZephyrEffect ZephyrTyVar) [ZephyrOpComment]
+                     | ZephyrTyCheckCheckSymbol !ZephyrTyErrorLocation !ZephyrTyVar !ZephyrTyVar
+                     | ZephyrTyCheckCheckBuiltin !ZephyrTyErrorLocation !(ZephyrT ZephyrStackAtomK ZephyrTyVar) !ZephyrTyVar
                        deriving Show
+
+data OpTypes = UserDefined [ZephyrTyCheckOp]
+             | Builtin
+               deriving Show
+
+data ZephyrOpComment = ZephyrNoComment
+                     | ZephyrSymbolType (ZephyrT ZephyrStackAtomK ZephyrTyVar)
+                     | ZephyrQuoteComments [ZephyrOpComment]
+
+instance Show ZephyrOpComment where
+    show ZephyrNoComment = "ZephyrNoComment"
+    show (ZephyrSymbolType ty) = concat ["ZephyrSymbolType (", ppZephyrTy ty, ")"]
+    show (ZephyrQuoteComments cs) = concat ["ZephyrQuoteComments ", show cs]
 
 data ZephyrTyCheckError where
     InfinitelyRecursiveType :: !ZephyrTyVar -> !ZephyrTyDesc -> ZephyrTyCheckError
@@ -77,7 +99,7 @@ data ZephyrTyCheckError where
     GenericFail :: !String -> ZephyrTyCheckError
 deriving instance Show ZephyrTyCheckError
 data ZephyrTyCheckLocation = LocatedAt !SourceRange !ZephyrTyCheckLocation
-                           | WhileCheckingAtom !(GenericZephyrAtom ZephyrBuilder ZephyrWord) !ZephyrTyCheckLocation
+                           | WhileCheckingAtom !ZephyrBuilderAtom !ZephyrTyCheckLocation
                            | WhileCheckingStateAssertion !(ZephyrExecState ZippyTyVarName) !ZephyrTyCheckLocation
                            | Here
                              deriving Show
@@ -130,8 +152,9 @@ zephyrST action = ZephyrTyCheckM $ \loc s ->
                      pure (Right res, s)
 
 certifyPackage :: ZephyrPackage -> ZephyrTyCheckedPackage
-certifyPackage pkg = fmap unwrapBuilder pkg
-    where unwrapBuilder (ZephyrBuilder ops) = ZephyrTyChecked [mapQuote unwrapBuilder atom | ZephyrAtom atom _ <- D.toList ops]
+certifyPackage pkg = fmap certifyZephyr pkg
+
+certifyZephyr (ZephyrBuilder ops) = ZephyrTyChecked [mapAsk (const (error "Ask in zephyr builder")) $ mapQuote certifyZephyr atom | ZephyrAtom atom _ <- D.toList ops]
 
 runInNewTyCheckM :: (forall s. ZephyrTyCheckM s x) -> Either ([ZephyrTyCheckLocation], ZephyrTyCheckError) x
 runInNewTyCheckM f = runST $
@@ -150,7 +173,11 @@ newTyCheckState = do var <- newSTRef 0
                              { nextVar = do ret <- readSTRef var
                                             modifySTRef' var (+ 1)
                                             return (ZephyrTyVar ret)
+                             , allocVar = \(ZephyrTyVar a) ->
+                                 do ret <- readSTRef var
+                                    when (ret < a) (writeSTRef var (a + 1))
                              , tyCheckTyVars = tyVars
+                             , tyCheckInstances = []
                              , unifyIndent = 0 })
 
 getPointForVariable :: ZephyrTyVar -> ZephyrTyCheckM s (Point s ZephyrTyDesc)
@@ -164,7 +191,11 @@ getPointForVariable tyVar =
                        return newPoint
          Just tyVarPoint -> return tyVarPoint
 
-tyCheckPackages :: ZephyrSymbolEnv (ZephyrEffect ZephyrTyVar) -> ZephyrTypeLookupEnv -> [ZephyrPackage] -> ZephyrTyCheckM s [ZephyrTyCheckedPackage]
+zipWith4 :: (a -> b -> c -> d -> e) -> [a] -> [b] -> [c] -> [d] -> [e]
+zipWith4 f a b c d = let ZipList e = f <$> ZipList a <*> ZipList b <*> ZipList c <*> ZipList d
+                     in e
+
+tyCheckPackages :: ZephyrSymbolEnv (ZephyrT ZephyrStackAtomK ZephyrTyVar) -> ZephyrTypeLookupEnv -> [ZephyrPackage] -> ZephyrTyCheckM s [DetailedTyCheckedPackage]
 tyCheckPackages pretypedSymbols types pkgs = tyCheck
     -- Basic type checking steps
     --
@@ -177,15 +208,48 @@ tyCheckPackages pretypedSymbols types pkgs = tyCheck
 
                        typedSymbolOps <- mkTypedSymbolOps typedSymbols
                        symbolEffects <- trace ("Got typed ops: " ++ ppTypedSymbols typedSymbolOps ++ "\n") (assertSymbols typedSymbolOps)
-                       unifySymbols typedSymbols symbolEffects
 
                        tyDescs <- gets tyCheckTyVars
                        tyDescs <- zephyrST (HT.foldM (\assocs (key, val) -> descriptor val >>= \val -> pure ((key, val):assocs)) [] tyDescs)
-                       symbolTypes <- trace (intercalate "\n" (map ppTyDesc tyDescs) ++ "\nDone") (mapM (mapM (\(ZephyrSymbolDefinition name ty) -> ZephyrSymbolDefinition name <$> simplifyEffect ty) . zephyrSymbols) symbolEffects)
-                       trace ("Got typed symbols: " ++ ppSymbolTypes symbolTypes ++ "\n") (return ())
-                       pure (fmap certifyPackage pkgs)
+                       symbolTypes <- trace (intercalate "\n" (map ppTyDesc tyDescs) ++ "\nDone") (mapM (mapM simplifyEffect) symbolEffects)
+                       symbolTypes' <- mapM (mapM generalizeType) symbolTypes
+                       unifySymbols typedSymbols symbolTypes'
 
+                       trace ("Got typed symbols: " ++ ppSymbolTypes (map zephyrSymbols symbolTypes') ++ "\n") (return ())
 
+                       symbolTypes' <- instantiateAll typedSymbols symbolEffects symbolTypes'
+
+                       trace ("Got typed symbols: " ++ ppSymbolTypes (map zephyrSymbols symbolTypes') ++ "\n") (return ())
+
+                       commentedOps <- mapM (mapM (commentOps . zephyrSymbolDefinition) . zephyrSymbols) typedSymbolOps
+                       -- We also want to return simplified versions of the symbol types and the typed operations
+                       pure (zipWith4 (\tyPkg  opCommentss pkg typedOpsPkg ->
+                                       pkg { zephyrSymbols =
+                                                 zipWith4 (\(ZephyrSymbolDefinition _ ty) opComments (ZephyrSymbolDefinition name bc) (ZephyrSymbolDefinition _ typedOps) ->
+                                                           ZephyrSymbolDefinition name (ty, opComments, typedOps, certifyZephyr bc))
+                                                          (zephyrSymbols tyPkg) opCommentss (zephyrSymbols pkg) (zephyrSymbols typedOpsPkg)} )
+                             symbolTypes' commentedOps pkgs typedSymbolOps)
+
+          instantiateAll typedSymbols symbolEffects symbolTypes =
+              do instancesToCheck <- gets tyCheckInstances
+                 forM_ instancesToCheck $ \(symVar, ty) -> do
+                   symP <- getPointForVariable symVar
+                   sym <- zephyrST (descriptor symP)
+                   trace ("Symbol " ++ ppTyDesc (symVar, sym)) (
+                     trace ("Instantiating " ++ ppTyDesc (symVar, ty)) (assertTyVarUnifies symVar ty :: ZephyrTyCheckM s (ZephyrT ZephyrStackAtomK ZephyrTyVar)))
+
+                 symbolEffects' <- mapM (mapM simplifyEffect) symbolEffects
+                 symbolTypes' <- mapM (mapM generalizeType) symbolEffects'
+                 let oldRanks = concatMap (map (rank . zephyrSymbolDefinition) . zephyrSymbols) symbolTypes
+                     newRanks = concatMap (map (rank . zephyrSymbolDefinition) . zephyrSymbols) symbolTypes'
+                     rank (ZephyrForAll _ _ t) = 1 + rank t
+                     rank _ = 0 :: Int
+                 unifySymbols typedSymbols symbolTypes'
+
+                 if oldRanks == newRanks then pure symbolTypes' else instantiateAll typedSymbols symbolEffects' symbolTypes'
+
+          allFreeVariables = do vars <- gets tyCheckTyVars
+                                S.fromList . map fst . filter (uncurry isFree) <$> zephyrST (mapM (\(key, val) -> (key,) <$> descriptor val) =<< HTC.toList vars)
           allSymbols = map zephyrSymbols pkgs
           ppTypedSymbols typedPkgs = intercalate "\n=======\n" $
                                      concatMap (\typedPkg ->
@@ -194,8 +258,8 @@ tyCheckPackages pretypedSymbols types pkgs = tyCheck
                                                                 , intercalate "\n" $ map ppTyCheckOp code ]) (zephyrSymbols typedPkg)) typedPkgs
           ppSymbolTypes typedPkgs = intercalate "\n=======\n" $
                                     concatMap (\typedPkg ->
-                                               map (\(ZephyrSymbolDefinition (ZephyrWord name) effect) ->
-                                                    concat [ "TY ", T.unpack name, " ", ppEffect effect, "\n"]) typedPkg) typedPkgs
+                                               map (\(ZephyrSymbolDefinition (ZephyrWord name) ty) ->
+                                                    concat [ "TY ", T.unpack name, " ", ppZephyrTy ty, "\n"]) typedPkg) typedPkgs
 
           assertSymbols typedOps = mapM (mapM assertSymbol) typedOps
 
@@ -210,6 +274,39 @@ tyCheckPackages pretypedSymbols types pkgs = tyCheck
           mkTypedSymbolOps typedSymbols = mapM (mapM (mkTypedZephyrBuilder types pretypedSymbols typedSymbols)) pkgs
 
 type TyCheckEndoM s x = x -> ZephyrTyCheckM s x
+
+generalizeType :: ZephyrEffect ZephyrTyVar -> ZephyrTyCheckM s (ZephyrT ZephyrStackAtomK ZephyrTyVar)
+generalizeType ty = foldrM (\v t ->
+                            do pt <- getPointForVariable v
+                               ZephyrTyDesc vTy _ <- zephyrST (descriptor pt)
+                               pure (ZephyrForAll (kindOf vTy) v t)) (ZephyrQuoteT ty) (allTyVariables ty)
+
+commentOps ops = catMaybes <$> mapM commentOp ops
+
+commentOp :: ZephyrTyCheckOp -> ZephyrTyCheckM s (Maybe ZephyrOpComment)
+commentOp (ZephyrTyCheckCheckSymbol _ _ tyVar) =
+    Just . ZephyrSymbolType <$> simplifyZephyrT (ZephyrVarT tyVar)
+commentOp (ZephyrTyCheckCheckBuiltin _ _ tyVar) =
+    Just . ZephyrSymbolType <$> simplifyZephyrT (ZephyrVarT tyVar)
+commentOp (ZephyrTyCheckCheckQuote _ _ comments) = Just . ZephyrQuoteComments <$> mapM simplifyComment comments
+    where simplifyComment (ZephyrSymbolType ty) = ZephyrSymbolType <$> simplifyZephyrT ty
+          simplifyComment (ZephyrQuoteComments comments) = ZephyrQuoteComments <$> mapM simplifyComment comments
+          simplifyComment x = pure x
+commentOp (ZephyrTyCheckCheckState _ _) = pure Nothing
+commentOp _ = pure (Just ZephyrNoComment)
+
+forceTyVars :: [ZephyrTyVar] -> ZephyrT k ZephyrTyVar -> ZephyrTyCheckM s (ZephyrT k ZephyrTyVar)
+forceTyVars vars ty =
+    do points <- mapM getPointForVariable vars
+       descriptors <- mapM (zephyrST . descriptor) points
+       let varMapping = mconcat (zipWith descMapping vars descriptors)
+           descMapping var (ZephyrTyDesc (ZephyrVarT mappedVar) _) = HM.singleton mappedVar var
+           descMapping _ _ = mempty
+
+           forceVar var = case HM.lookup var varMapping of
+                            Just oldVar -> oldVar
+                            Nothing -> var
+       trace ("Forced vars " ++ show varMapping) (pure (fmap forceVar ty))
 
 simplifyTyDesc :: TyCheckEndoM s ZephyrTyDesc
 simplifyTyDesc (ZephyrTyDesc z loc) = ZephyrTyDesc <$> simplifyZephyrT z <*> pure loc
@@ -234,17 +331,21 @@ simplifyZephyrT (ZephyrVarT tyVar) =
          ZephyrTyDesc ty _ -> case safeCoercedKind ty of
                                 Just ty -> simplifyZephyrT ty
                                 Nothing -> fail "Kind mismatch during simplification"
+simplifyZephyrT (ZephyrForAll k v ty) =
+    do v' <- newTyVar
+       ZephyrForAll k v' <$> simplifyZephyrT (fmap (\oldV -> if oldV == v then v' else oldV) ty)
 
 simplifyZipperTyCon :: TyCheckEndoM s (GenericZippyTyCon (ZephyrT ZephyrZipperK ZephyrTyVar))
 simplifyZipperTyCon (ZippyTyCon tyName tyArgs) =
     ZippyTyCon tyName <$> mapM simplifyZephyrT tyArgs
 
-unifySymbols :: ZephyrSymbolEnv ZephyrTyVar -> [GenericZephyrPackage (ZephyrEffect ZephyrTyVar)] -> ZephyrTyCheckM s ()
+unifySymbols :: ZephyrSymbolEnv ZephyrTyVar -> [GenericZephyrPackage (ZephyrT ZephyrStackAtomK ZephyrTyVar)] -> ZephyrTyCheckM s ()
 unifySymbols env typedPackages =
     mapM (\pkg -> mapM (unifyPkgSymbol (zephyrPackageName pkg)) (zephyrSymbols pkg)) typedPackages >> return ()
-    where unifyPkgSymbol pkgName (ZephyrSymbolDefinition sym eff) =
-              let Just tyVar = lookupInSymbolEnv (Right (pkgName, sym)) env
-              in assertTyVarUnifies' tyVar (ZephyrQuoteT eff)
+    where unifyPkgSymbol pkgName (ZephyrSymbolDefinition sym ty) =
+              do let Just tyVar = lookupInSymbolEnv (Right (pkgName, sym)) env
+                 tyP <- getPointForVariable tyVar
+                 trace ("Set descriptor " ++ show tyVar ++ " to " ++ ppZephyrTy ty) (zephyrST (setDescriptor tyP (ZephyrTyDesc ty mempty)))
 
 assertSymbol :: [ZephyrTyCheckOp] -> ZephyrTyCheckM s (ZephyrEffect ZephyrTyVar)
 assertSymbol typedOps = do initialZipper <- newTyVar
@@ -264,15 +365,28 @@ assertTyCheckOp actNow (ZephyrTyCheckCheckState loc expNow) =
     inNestedLocation loc $
     do assertState actNow expNow
        pure expNow
+assertTyCheckOp st (ZephyrTyCheckCheckQuote loc eff _) =
+    assertTyCheckOp st (ZephyrTyCheckCheckEffect loc eff)
 assertTyCheckOp (ZephyrExecState actZipper actBefore) (ZephyrTyCheckCheckEffect loc (ZephyrEffect expZipper expBefore after)) =
     inNestedLocation loc $
     do assertState (ZephyrExecState actZipper actBefore) (ZephyrExecState expZipper expBefore)
        pure (ZephyrExecState expZipper after)
-assertTyCheckOp (ZephyrExecState actZipper actBefore) (ZephyrTyCheckCheckSymbol loc symVar) =
+assertTyCheckOp (ZephyrExecState actZipper actBefore) (ZephyrTyCheckCheckSymbol loc symVar monoVar) =
     inNestedLocation loc $
     do afterStk <- stackVarT <$> newTyVar
-       assertTyVarUnifies' symVar (ZephyrQuoteT (ZephyrEffect actZipper actBefore afterStk))
+       let monoType = ZephyrQuoteT (ZephyrEffect actZipper actBefore afterStk)
+       assertTyVarInstantiates' symVar monoType
+       unifyZephyrT (ZephyrVarT monoVar) monoType
        pure (ZephyrExecState actZipper afterStk)
+assertTyCheckOp st (ZephyrTyCheckCheckBuiltin loc ty monoType) =
+    do eff <- instantiateEffect ty
+       unifyZephyrT (ZephyrVarT monoType) (ZephyrQuoteT eff)
+       assertTyCheckOp st (ZephyrTyCheckCheckEffect loc eff)
+    where instantiateEffect :: ZephyrT ZephyrStackAtomK ZephyrTyVar -> ZephyrTyCheckM s (ZephyrEffect ZephyrTyVar)
+          instantiateEffect (ZephyrForAll _ v ty) =
+              do subVar <- newTyVar
+                 instantiateEffect (fmap (\var -> if var == v then subVar else var) ty)
+          instantiateEffect (ZephyrQuoteT x) = pure x
 
 assertState :: ZephyrExecState ZephyrTyVar -> ZephyrExecState ZephyrTyVar -> ZephyrTyCheckM s (ZephyrExecState ZephyrTyVar)
 assertState (ZephyrExecState actualZipper actualStack) (ZephyrExecState expZipper expStack) =
@@ -352,10 +466,13 @@ withResultKind f = let res = f (getKind (proxy res))
                        proxy _ =  Proxy
                    in res
 
+assertTyVarInstantiates' :: IsKind k => ZephyrTyVar -> ZephyrT k ZephyrTyVar -> ZephyrTyCheckM s ()
+assertTyVarInstantiates' tyVar expTy = modify $ \st -> st { tyCheckInstances = (tyVar, ZephyrTyDesc expTy mempty):tyCheckInstances st }
+
 assertTyVarUnifies' :: IsKind k => ZephyrTyVar -> ZephyrT k ZephyrTyVar -> ZephyrTyCheckM s (ZephyrT k ZephyrTyVar)
 assertTyVarUnifies' tyVar expTy = assertTyVarUnifies tyVar (ZephyrTyDesc expTy mempty)
 
-assertTyVarUnifies :: IsKind k => ZephyrTyVar -> ZephyrTyDesc -> ZephyrTyCheckM s (ZephyrT k ZephyrTyVar)
+assertTyVarUnifies ::  IsKind k => ZephyrTyVar -> ZephyrTyDesc -> ZephyrTyCheckM s (ZephyrT k ZephyrTyVar)
 assertTyVarUnifies tyVar expTyDesc =
     withResultKind $ \kind ->
     increaseIndent $ \indent ->
@@ -385,6 +502,12 @@ increaseIndent a = do indentN <- gets unifyIndent
                       return r
 
 unifyZephyrT :: IsKind k => ZephyrT k ZephyrTyVar -> ZephyrT k ZephyrTyVar -> ZephyrTyCheckM s (ZephyrT k ZephyrTyVar)
+unifyZephyrT actTy@(ZephyrForAll k v act) exp = do subVar <- newTyVar
+                                                   unifyZephyrT (fmap (\var -> if var == v then subVar else var) act) exp
+                                                   return actTy
+unifyZephyrT act expTy@(ZephyrForAll k v exp) = do subVar <- newTyVar
+                                                   unifyZephyrT act (fmap (\var -> if var == v then subVar else var) exp)
+                                                   return expTy
 unifyZephyrT (ZephyrVarT actualVar) (ZephyrVarT expVar) = assertTyVarEquality actualVar expVar
 unifyZephyrT (ZephyrVarT actualVar) exp = assertTyVarUnifies actualVar (ZephyrTyDesc exp mempty)
 unifyZephyrT act (ZephyrVarT expVar) = assertTyVarUnifies expVar (ZephyrTyDesc act mempty)
@@ -419,11 +542,11 @@ unifyTyDesc (ZephyrTyDesc act actLoc) (ZephyrTyDesc exp expLoc) =
                             return (ZephyrTyDesc newTy (actLoc <> expLoc))
       Nothing -> trace "Die at ty desc unify" (dieTyCheck (actLoc <> expLoc) (KindMismatch act exp))
 
-mkTypedZephyrBuilder :: ZephyrTypeLookupEnv -> ZephyrSymbolEnv (ZephyrEffect ZephyrTyVar) -> ZephyrSymbolEnv ZephyrTyVar -> ZephyrBuilder -> ZephyrTyCheckM s [ZephyrTyCheckOp]
+mkTypedZephyrBuilder :: ZephyrTypeLookupEnv -> ZephyrSymbolEnv (ZephyrT ZephyrStackAtomK ZephyrTyVar) -> ZephyrSymbolEnv ZephyrTyVar -> ZephyrBuilder -> ZephyrTyCheckM s [ZephyrTyCheckOp]
 mkTypedZephyrBuilder types pretypedSymbols typedSymbols (ZephyrBuilder ops) = mapM (mkAtomType types pretypedSymbols typedSymbols) (D.toList ops)
 
-mkAtomType :: ZephyrTypeLookupEnv -> ZephyrSymbolEnv (ZephyrEffect ZephyrTyVar) -> ZephyrSymbolEnv ZephyrTyVar -> ZephyrBuilderOp -> ZephyrTyCheckM s ZephyrTyCheckOp
-mkAtomType types pretypedSymbols typedSymbols (ZephyrAtom a loc) = either (ZephyrTyCheckCheckEffect locAtom) (ZephyrTyCheckCheckSymbol locAtom) <$> atomType types pretypedSymbols typedSymbols a
+mkAtomType :: ZephyrTypeLookupEnv -> ZephyrSymbolEnv (ZephyrT ZephyrStackAtomK ZephyrTyVar) -> ZephyrSymbolEnv ZephyrTyVar -> ZephyrBuilderOp -> ZephyrTyCheckM s ZephyrTyCheckOp
+mkAtomType types pretypedSymbols typedSymbols (ZephyrAtom a loc) = atomType locAtom types pretypedSymbols typedSymbols a
     where locAtom = ZephyrTyErrorLocation (WhileCheckingAtom a . LocatedAt loc)
 mkAtomType types _ _ (ZephyrStateAssertion s loc) = ZephyrTyCheckCheckState loc' <$> instantiateState (qualifyState types s)
     where loc' = ZephyrTyErrorLocation (WhileCheckingStateAssertion s . LocatedAt loc)
@@ -441,40 +564,51 @@ qualifyState types (ZephyrExecState zipper stack) = ZephyrExecState (qualifyZeph
           qualifyZephyrT ZephyrStackBottomT = ZephyrStackBottomT
           qualifyZephyrT (stk :> atom) = qualifyZephyrT stk :> qualifyZephyrT atom
 
-atomType :: ZephyrTypeLookupEnv -> ZephyrSymbolEnv (ZephyrEffect ZephyrTyVar) -> ZephyrSymbolEnv ZephyrTyVar -> GenericZephyrAtom ZephyrBuilder ZephyrWord -> ZephyrTyCheckM s (Either (ZephyrEffect ZephyrTyVar) ZephyrTyVar)
-atomType _ _ _ (IntegerZ _) = Left <$> instantiate "z | *s -->  *s Integer"
-atomType _ _ _ (TextZ _) = Left <$> instantiate "z | *s --> *s Text"
-atomType _ _ _ (FloatingZ _) = Left <$> instantiate "z | *s --> *s Floating"
-atomType _ _ _ (BinaryZ _) = Left <$> instantiate "z | *s --> *s Binary"
-atomType types pretyped syms (QuoteZ q) = do typedQ <- mkTypedZephyrBuilder types pretyped syms q
-                                             quoteEffect <- assertSymbol typedQ
-                                             stk <- stackVarT <$> newTyVar
-                                             zipper <- zipperVarT <$> newTyVar
-                                             trace ("Find quote " ++ show q ++ " has type " ++ ppEffect quoteEffect) (pure (Left (ZephyrEffect zipper stk (stk :> ZephyrQuoteT quoteEffect))))
-atomType _ pretyped syms (SymZ sym) = case lookupInSymbolEnv (Left sym) pretyped of
-                                        Nothing -> case lookupInSymbolEnv (Left sym) syms of
-                                                     Nothing -> error ("Could not resolve symbol " ++ show sym ++ "\n" ++ show pretyped ++ "\n" ++ show syms)
-                                                     Just v -> pure (Right v)
-                                        Just eff -> trace ("Looked up " ++ show sym ++ ": has effect " ++ ppEffect eff) (pure (Left eff))
-atomType _ _ _ ZipUpZ = error "ZipUpZ is un-typable"
-atomType _ _ _ ZipDownZ = error "Cannot handle ZipDownZ yet"
-atomType _ _ _ ZipReplaceZ = Left <$> instantiate "focus | *s focus -->  *s"
-atomType _ _ _ CurAtomZ = Left <$> instantiate "focus | *s --> *s focus"
-atomType _ _ _ CurTagZ = Left <$> instantiate "focus | *s --> *s Integer"
-atomType _ _ _ ArgHoleZ = Left <$> instantiate "z | *s --> *s Integer"
-atomType _ _ _ EnterZipperZ = Left <$> instantiate "z | *s z' (z' | *s --> *s') --> *s' z'"
-atomType _ _ _ CutZ = Left <$> instantiate "z | *s --> *s z"
-atomType _ _ _ DipZ = Left <$> instantiate "z | *s t (z | *s --> *s') -->  *s' t"
-atomType _ _ _ ZapZ = Left <$> instantiate "z | *s t --> *s"
-atomType _ _ _ DupZ = Left <$> instantiate "z | *s t --> *s t t"
-atomType _ _ _ SwapZ = Left <$> instantiate "z | *s a b --> *s b a"
-atomType _ _ _ DeQuoteZ = Left <$> instantiate "z | *s (z | *s --> *t) --> *t"
-atomType _ _ _ IfThenElseZ = Left <$> instantiate "z | *s (z | *s --> *s' base:Bool) (z | *s' --> *s'') (z | *s' --> *s'') --> *s''"
-atomType _ _ _ PlusZ = Left <$> instantiate "z | *s Integer Integer --> *s Integer"
-atomType _ _ _ EqZ = Left <$> instantiate "z | *s a a --> *s base:Bool"
-atomType _ _ _ LtZ = Left <$> instantiate "z | *s a a --> *s base:Bool"
-atomType _ _ _ GtZ = Left <$> instantiate "z | *s a a --> *s base:Bool"
-atomType _ _ _ op = fail ("No clue how to handle op " ++ show op)
+atomType :: ZephyrTyErrorLocation -> ZephyrTypeLookupEnv -> ZephyrSymbolEnv (ZephyrT ZephyrStackAtomK ZephyrTyVar) -> ZephyrSymbolEnv ZephyrTyVar -> ZephyrBuilderAtom -> ZephyrTyCheckM s ZephyrTyCheckOp
+atomType l _ _ _ (IntegerZ _) = ZephyrTyCheckCheckEffect l <$> instantiate "z | *s -->  *s Integer"
+atomType l _ _ _ (TextZ _) = ZephyrTyCheckCheckEffect l <$> instantiate "z | *s --> *s Text"
+atomType l _ _ _ (FloatingZ _) = ZephyrTyCheckCheckEffect l <$> instantiate "z | *s --> *s Floating"
+atomType l _ _ _ (BinaryZ _) = ZephyrTyCheckCheckEffect l <$> instantiate "z | *s --> *s Binary"
+atomType l types pretyped syms (QuoteZ q) = do typedQ <- mkTypedZephyrBuilder types pretyped syms q
+                                               quoteEffect <- assertSymbol typedQ
+                                               stk <- stackVarT <$> newTyVar
+                                               zipper <- zipperVarT <$> newTyVar
+                                               comments <- commentOps typedQ
+                                               trace ("Find quote " ++ show q ++ " has type " ++ ppEffect quoteEffect) (pure (ZephyrTyCheckCheckQuote l (ZephyrEffect zipper stk (stk :> ZephyrQuoteT quoteEffect)) comments))
+atomType l _ pretyped syms (SymZ _ sym) = case lookupInSymbolEnv (Left sym) pretyped of
+                                            Nothing -> case lookupInSymbolEnv (Left sym) syms of
+                                                         Nothing -> error ("Could not resolve symbol " ++ show sym ++ "\n" ++ show pretyped ++ "\n" ++ show syms)
+                                                         Just v -> do monoType <- newTyVar
+                                                                      pure (ZephyrTyCheckCheckSymbol l v monoType)
+                                            Just ty -> do monoType <- newTyVar
+                                                          trace ("Looked up " ++ show sym ++ ": has effect " ++ ppZephyrTy ty) (pure (ZephyrTyCheckCheckBuiltin l ty monoType))
+atomType l _ _ _ ZipUpZ = error "ZipUpZ is un-typable"
+atomType l _ _ _ ZipDownZ = error "Cannot handle ZipDownZ yet"
+atomType l _ _ _ ZipReplaceZ = ZephyrTyCheckCheckEffect l <$> instantiate "focus | *s focus -->  *s"
+atomType l _ _ _ CurAtomZ = ZephyrTyCheckCheckEffect l <$> instantiate "focus | *s --> *s focus"
+atomType l _ _ _ CurTagZ = ZephyrTyCheckCheckEffect l <$> instantiate "focus | *s --> *s Integer"
+atomType l _ _ _ ArgHoleZ = ZephyrTyCheckCheckEffect l <$> instantiate "z | *s --> *s Integer"
+atomType l _ _ _ EnterZipperZ = ZephyrTyCheckCheckEffect l <$> instantiate "z | *s z' (z' | *s --> *s') --> *s' z'"
+atomType l _ _ _ CutZ = ZephyrTyCheckCheckEffect l <$> instantiate "z | *s --> *s z"
+atomType l _ _ _ DipZ = ZephyrTyCheckCheckEffect l <$> instantiate "z | *s t (z | *s --> *s') -->  *s' t"
+atomType l _ _ _ ZapZ = ZephyrTyCheckCheckEffect l <$> instantiate "z | *s t --> *s"
+atomType l _ _ _ DupZ = ZephyrTyCheckCheckEffect l <$> instantiate "z | *s t --> *s t t"
+atomType l _ _ _ SwapZ = ZephyrTyCheckCheckEffect l <$> instantiate "z | *s a b --> *s b a"
+atomType l _ _ _ DeQuoteZ = ZephyrTyCheckCheckEffect l <$> instantiate "z | *s (z | *s --> *t) --> *t"
+atomType l _ _ _ IfThenElseZ = ZephyrTyCheckCheckEffect l <$> instantiate "z | *s (z | *s --> *s' base:Bool) (z | *s' --> *s'') (z | *s' --> *s'') --> *s''"
+atomType l _ _ _ PlusZ = ZephyrTyCheckCheckEffect l <$> instantiate "z | *s Integer Integer --> *s Integer"
+atomType l _ _ _ EqZ = ZephyrTyCheckCheckEffect l <$> instantiate "z | *s a a --> *s base:Bool"
+atomType l _ _ _ LtZ = ZephyrTyCheckCheckEffect l <$> instantiate "z | *s a a --> *s base:Bool"
+atomType l _ _ _ GtZ = ZephyrTyCheckCheckEffect l <$> instantiate "z | *s a a --> *s base:Bool"
+atomType l _ _ _ FailZ = ZephyrTyCheckCheckEffect l <$> instantiate "z | *s a --> *s"
+atomType l _ _ _ YieldZ = ZephyrTyCheckCheckEffect l <$> instantiate "z | *s a --> *s"
+atomType l _ _ _ RandomZ = ZephyrTyCheckCheckEffect l <$> instantiate "z | *s --> *s Integer"
+atomType l _ _ _ LogZ = ZephyrTyCheckCheckEffect l <$> instantiate "z | *s a --> *s"
+atomType l _ _ _ TraceZ = ZephyrTyCheckCheckEffect l <$> instantiate "z | *s --> *s"
+atomType l _ _ _ op = fail ("No clue how to handle op " ++ show op)
+
+allocateTyVariable :: ZephyrTyVar -> ZephyrTyCheckM s ()
+allocateTyVariable tyVar = gets allocVar >>= zephyrST . ($ tyVar)
 
 newTyVar :: ZephyrTyCheckM s ZephyrTyVar
 newTyVar = gets nextVar >>= zephyrST
@@ -484,7 +618,10 @@ ppTyVar (ZephyrTyVar i) = 'v':show i
 
 ppTyCheckOp :: ZephyrTyCheckOp -> String
 ppTyCheckOp (ZephyrTyCheckCheckState _ st) = "Check state: " ++ ppState st
+ppTyCheckOp (ZephyrTyCheckCheckQuote _ eff _) = "Check quote: " ++ ppEffect eff
 ppTyCheckOp (ZephyrTyCheckCheckEffect _ eff) = "Check effect: " ++ ppEffect eff
+ppTyCheckOp (ZephyrTyCheckCheckSymbol _ tyVar _) = "Check symbol: " ++ ppTyVar tyVar
+ppTyCheckOp (ZephyrTyCheckCheckBuiltin _ ty _) = "Check builtin: " ++ ppZephyrTy ty
 
 ppState :: ZephyrExecState ZephyrTyVar -> String
 ppState (ZephyrExecState zipper stk) = concat [ ppZephyrTy zipper
@@ -519,6 +656,7 @@ ppZephyrTy (ZephyrZipperT z) = ppField z
 ppZephyrTy (ZephyrQuoteT eff) = concat ["(", ppEffect eff, ")"]
 ppZephyrTy ZephyrStackBottomT = "0"
 ppZephyrTy (stk :> top) = concat [ppZephyrTy stk, " ", ppZephyrTy top]
+ppZephyrTy (ZephyrForAll k v ty) = concat [ "∀(", ppTyVar v, "::", show k, "). ", ppZephyrTy ty ]
 
 ppTyName :: ZippyTyName -> String
 ppTyName (ZippyTyName mod name) = concat [T.unpack mod, ":", T.unpack name]

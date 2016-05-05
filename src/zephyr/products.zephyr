@@ -1,0 +1,32 @@
+PACKAGE products
+
+DATA Product ==
+	CONS PhysicalProduct     sku=Text title=Text description=Text price=Floating weight=Floating
+        CONS DownloadableProduct sku=Text title=Text description=Text price=Floating url=Text
+
+DATA ProductsDatabase ==
+        CONS ProductsDatabase by-sku=(Treap Text Product) description-index=(Treap Text (Treap Text Integer))
+
+{
+DEFINE add-physical-product ==
+  !(ProductsDatabase | *s Text Text Text Floating Floating)
+  [[[[DUP] DIP ] DIP] DIP] DIP
+  PhysicalProduct
+  SWAP
+  [[text-compare] DIP] DIP
+  [ insert-treap ] VISIT-ProuctsDatabase-by-sku}
+
+{
+insert k v (Leaf _ _ ) = Branch k v Leaf Leaf
+insert k v (Branch k' v l r) = if k > k' then Branch k' v l (insert k v r) else if k < k' then Branch k' v  (insert k v l r) r else Branch k v l r
+
+-->
+
+ProductsDatabase (Map ProductId Product) (Map Float (Set ProductId))
+
+data [a] = a : [a]
+         | []
+
+data Product = PhysicalProduct Text Int Int Float
+             | DownloadableProduct
+}

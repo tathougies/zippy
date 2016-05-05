@@ -27,7 +27,7 @@ module Database.Zippy.Types
     , txnStepTxnId
 
     , move, moveOOB, cur, cut, childRef, curTy, parentArgHole, commit, abort
-    , logAction
+    , logAction, randomIntTx
 
     , TxnId(..), RunTxnStepFn(..), TxnStep(..)
     , TxLogAction(..), simpleTxActionLogger, txResultActionLogger
@@ -321,6 +321,8 @@ data TxF next = MoveTx !Movement (MoveResult -> next)
               | AbortTx
 
               | LogActionTx !TxLogAction next
+
+              | RandomTx (Int64 -> next)
                 deriving Functor
 type Tx = F TxF
 
@@ -372,6 +374,9 @@ abort = liftF AbortTx
 
 logAction :: TxLogAction -> Tx ()
 logAction act = liftF (LogActionTx act ())
+
+randomIntTx :: Tx Int64
+randomIntTx = liftF (RandomTx id)
 
 -- ** Multiple concurrent transactions
 

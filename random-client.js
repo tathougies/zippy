@@ -55,7 +55,7 @@ var q = async.queue(function ( data, allDone ) {
 			releaseSock(client);
 			tryAgain();
 		    } else if (data == 'BEGIN' ) {
-		    } else if (data != '()' && data.toString().substring(0, 5) != "Moved"&& data != "" ) {
+		    } else if (data != '()' && data.indexOf('ALL DONE') != 0 && data.toString().substring(0, 5) != "Moved"&& data != "" ) {
 			console.log("Client reported error: " + data);
 			releaseSock(client);
 			process.exit();
@@ -67,7 +67,9 @@ var q = async.queue(function ( data, allDone ) {
 	    client.write("down 0\n");
 	    console.log("[" + i + "] insert", newRandom);
 //	    console.time('insert');
-	    client.write("insert " + newRandom + " \"This is key " + newRandom + "\"\n");
+	    client.write("insert " + newRandom + " \"This is key " + newRandom + "\" \n");
+	    //	    client.write("query insert-key " + newRandom + " \"This is key " + newRandom + "\" \n");
+	    //client.write("txquery insert-key " + newRandom + " \"This is key " + newRandom + "\" \n");
 //	    client.write("commit\n");
 	});
     }

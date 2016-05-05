@@ -1,4 +1,4 @@
-{-# LANGUAGE OverloadedStrings, RankNTypes #-}
+{-# LANGUAGE OverloadedStrings, RankNTypes, FlexibleContexts #-}
 module Database.Zippy.Zephyr.Parse where
 
 import Database.Zippy.Types
@@ -41,8 +41,9 @@ zephyrConsIdentifier = do name <- many1 (satisfy (\c -> c /= ' ' && c /= '\t' &&
                           pure name
 
 whitespace :: Parser ()
-whitespace = (oneOf " \t\v\r\n" *> optional whitespace) <|> (char '{' *> consumeComment *> optional whitespace) <|> pure ()
-    where consumeComment = many (satisfy (/= '}')) *> char '}'
+whitespace = (oneOf " \t\v\r\n" *> optional whitespace) <|> comment <|> pure ()
+    where comment = char '{' *> consumeComment *> optional whitespace
+          consumeComment = many1 ((satisfy (\c -> c /= '}' && c /= '{') *> pure ()) <|> comment) *> char '}'
 
 stateAssertionP :: Parser (ZephyrExecState ZippyTyVarName)
 stateAssertionP = char '!' *> whitespace *>
@@ -76,13 +77,15 @@ atomP = unquotedAtomP <|>
                             "IFTE"     -> pure IfThenElseZ
                             "FAIL"     -> pure FailZ
                             "LOG"      -> pure LogZ
+                            "TRACE"    -> pure TraceZ
                             "YIELD"    -> pure YieldZ
                             "LENGTH"   -> pure LengthZ
+                            "RANDOM"   -> pure RandomZ
                             "=="       -> pure EqZ
                             ">"        -> pure GtZ
                             "<"        -> pure LtZ
                             "+"        -> pure PlusZ
-                            _          -> pure (SymZ (fromString identifier))
+                            _          -> pure (SymZ mempty (fromString identifier))
 
 literalP :: Parser ZephyrD
 literalP = do res <- unquotedAtomP
@@ -92,7 +95,7 @@ literalP = do res <- unquotedAtomP
                 TextZ t -> return (ZephyrD (TextD t))
                 BinaryZ b -> return (ZephyrD (BinaryD b))
 
-unquotedAtomP :: Parser (GenericZephyrAtom a b)
+unquotedAtomP :: Parser (GenericZephyrAtom asks q a)
 unquotedAtomP = (either (IntegerZ . fromIntegral) FloatingZ <$> signedNatFloat) <|>
                 (TextZ . fromString <$> (stringLiteral :: Parser String)) <|>
                 (BinaryZ . fromString <$> (char '$' *> (stringLiteral :: Parser String)))  <?> "unquoted atom"

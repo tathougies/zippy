@@ -133,6 +133,43 @@ internType types env ty = runState (collectType ty) env
                                                    , instantiatedCount = newTyRef + 1 }) >>
                                     collectType internedType
 
+zephyrTyToInstantiatedTy :: ZippyFieldType (RecZephyrType tyVar) -> ZephyrInstantiatedType
+zephyrTyToInstantiatedTy (RefFieldT (ZippyTyCon tyName tyArgs)) = ZephyrInstantiatedType (ZippyTyCon tyName (fmap fromZephyrT tyArgs))
+    where fromZephyrT :: ZephyrT ZephyrZipperK tyVar -> ZippyFieldType ZephyrInstantiatedType
+          fromZephyrT (ZephyrVarT _) = error "Cannot instantiate varT"
+          fromZephyrT (ZephyrZipperT (SimpleFieldT i)) = SimpleFieldT i
+          fromZephyrT (ZephyrZipperT (RefFieldT (ZippyTyCon tyName tyArgs))) =
+              RefFieldT . ZephyrInstantiatedType $ (ZippyTyCon tyName (fmap fromZephyrT tyArgs))
+          fromZephyrT (ZephyrForAll _ _ _) = error "Cannot instantiate existential"
+
+getTypesAsZippyT :: ZephyrTypeLookupEnv -> ZephyrTypeInstantiationEnv -> [ZippyT]
+getTypesAsZippyT tyEnv env =
+    let allInstantiatedTypes = D.toList (instantiatedTypesList env)
+
+        toZippyT (ZephyrInstantiatedType tyCon) =
+            let tyCon'@(ZippyTyCon tyName tyArgValues) = toZippyTyCon tyCon
+                Just (ZippyAlgebraicT (ZippyTyCon _ tyArgs) dataCons) = lookupInTyEnv tyName tyEnv
+
+                tyArgsToValues = HM.fromList (V.toList (V.zip tyArgs tyArgValues))
+
+                lookupTyArg :: ZephyrScopedTy -> ZippyFieldType ZippyTyRef
+                lookupTyArg (Local tyArg) = case HM.lookup tyArg tyArgsToValues of
+                                              Just val -> fmap snd val
+                                              Nothing -> error "Free variable in data constructor"
+                lookupTyArg (Global (SimpleFieldT i)) = SimpleFieldT i
+                lookupTyArg (Global (RefFieldT tyCon)) =
+                    let instantiatedCon = fmap lookupTyArg' tyCon
+                        lookupTyArg' (Local tyArg) = case HM.lookup tyArg tyArgsToValues of
+                                                       Just val -> fmap fst val
+                                                       Nothing -> error "free variable in data constructor"
+                        lookupTyArg' (Global (SimpleFieldT i)) = SimpleFieldT i
+                        lookupTyArg' (Global (RefFieldT tyCon)) = RefFieldT (ZephyrInstantiatedType (fmap lookupTyArg' tyCon))
+                    in RefFieldT (fst (internType tyEnv env (ZephyrInstantiatedType instantiatedCon)))
+            in AlgebraicT $ ZippyAlgebraicT (fmap (fmap snd) tyCon') (fmap (fmap lookupTyArg) dataCons)
+
+        toZippyTyCon tyCon = fmap (fmap (\ty -> (ty, fst . internType tyEnv env $ ty))) tyCon
+    in map toZippyT allInstantiatedTypes
+
 lookupInSymbolEnv :: Either ZephyrWord (ZephyrWord, ZephyrWord) -> ZephyrSymbolEnv v -> Maybe v
 lookupInSymbolEnv (Right qualified) env = HM.lookup qualified (qualifiedSymbols env)
 lookupInSymbolEnv (Left unqualified) env =

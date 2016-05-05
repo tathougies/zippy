@@ -1,4 +1,4 @@
-{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE OverloadedStrings, FlexibleContexts #-}
 module Database.Zippy.Data ( parseZippyD, decimal, parseTextD, defaultForSchema, showZippyD ) where
 
 import Database.Zippy.Types

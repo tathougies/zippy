@@ -1,4 +1,4 @@
-{-# LANGUAGE TupleSections, OverloadedStrings #-}
+{-# LANGUAGE TupleSections, OverloadedStrings, TypeFamilies, LambdaCase #-}
 module Database.Zippy.Zephyr.Compile where
 
 import Prelude hiding (foldl)
@@ -7,6 +7,7 @@ import Database.Zippy.Types
 import Database.Zippy.Zephyr.Types
 import Database.Zippy.Zephyr.TyCheck
 import Database.Zippy.Zephyr.Internal
+import Database.Zippy.Zephyr.JIT
 
 import Control.Arrow
 import Control.Applicative
@@ -16,11 +17,16 @@ import Data.Maybe
 import Data.Monoid
 import Data.Int
 import Data.Foldable (foldl)
+import Data.Graph (stronglyConnComp, topSort, graphFromEdges, SCC(..))
+import Data.List (intercalate)
 import qualified Data.HashMap.Strict as HM
 import qualified Data.Map as M
 import qualified Data.Vector as V
 import qualified Data.Text as T
 import qualified Data.Set as S
+import qualified Data.DList as D
+
+import Text.Parsec.Pos (newPos)
 
 import Debug.Trace
 
@@ -29,41 +35,44 @@ scopedTyToZipper (Local var) = ZephyrVarT var
 scopedTyToZipper (Global (SimpleFieldT s)) = ZephyrZipperT (SimpleFieldT s)
 scopedTyToZipper (Global (RefFieldT r)) = ZephyrZipperT (RefFieldT (fmap scopedTyToZipper r))
 
-genDefinitionsForType :: ZippyTyRef -> GenericZippyAlgebraicT ZippyTyVarName ZephyrScopedTy -> [(ZephyrEffect ZippyTyVarName, GenericZephyrSymbolDefinition ZephyrTyChecked)]
+genDefinitionsForType :: ZippyTyRef -> GenericZippyAlgebraicT ZippyTyVarName ZephyrScopedTy -> [(ZephyrEffect ZippyTyVarName, [ZephyrT ZephyrStackAtomK ZippyTyVarName], GenericZephyrSymbolDefinition CompiledZephyr)]
 genDefinitionsForType tyRef (ZippyAlgebraicT tyCon cons) = concatMap genDefinitionsForCon (zip [0..] (V.toList cons))
     where tyConZ = ZephyrZipperT (RefFieldT (fmap ZephyrVarT tyCon))
+          tyConStackAtomZ = ZephyrZipperT (RefFieldT (fmap ZephyrVarT tyCon))
 
-          genDefinitionsForCon :: (Int, GenericZippyDataCon ZephyrScopedTy) -> [(ZephyrEffect ZippyTyVarName, GenericZephyrSymbolDefinition ZephyrTyChecked)]
+          build = CompiledZephyr . V.fromList
+
+          genDefinitionsForCon :: (Int, GenericZippyDataCon ZephyrScopedTy) -> [(ZephyrEffect ZippyTyVarName, [ZephyrT ZephyrStackAtomK ZippyTyVarName], GenericZephyrSymbolDefinition CompiledZephyr)]
           genDefinitionsForCon (conIndex, ZippyDataCon (ZippyDataConName conName) argTys) =
-              [ ( ZephyrEffect (ZephyrVarT "$z") (ZephyrVarT "$s" :> tyConZ) (ZephyrVarT "$s" :> boolAtomTy)
+              [ ( ZephyrEffect (ZephyrVarT "$z") (ZephyrVarT "$s" :> tyConZ) (ZephyrVarT "$s" :> boolAtomTy), []
                 , ZephyrSymbolDefinition (ZephyrWord ("IS-" <> conName <> "?"))
-                  ( ZephyrTyChecked $
-                    [ QuoteZ (ZephyrTyChecked $
+                  ( build $
+                    [ QuoteZ (build $
                               [ CurTagZ
                               , IntegerZ (fromIntegral conIndex)
                               , EqZ ])
                     , EnterZipperZ
-                    , SwapZ ] ))
+                    , ZapZ] ))
 
-              , ( ZephyrEffect tyConZ (ZephyrVarT "$s") (ZephyrVarT "$s" :> boolAtomTy)
+              , ( ZephyrEffect tyConZ (ZephyrVarT "$s") (ZephyrVarT "$s" :> boolAtomTy), []
                 , ZephyrSymbolDefinition (ZephyrWord ("CUR-IS-" <> conName <> "?"))
-                  ( ZephyrTyChecked $
+                  ( build $
                     [ CurTagZ
                     , IntegerZ (fromIntegral conIndex)
                     , EqZ ] ) )
 
-              , ( ZephyrEffect (ZephyrVarT "$z") (ZephyrVarT "$s") (ZephyrVarT "$s" :> tyConZ)
+              , ( ZephyrEffect (ZephyrVarT "$z") (foldl (:>) (ZephyrVarT "$s") (map (scopedTyToZipper . zippyFieldType) (V.toList argTys))) (ZephyrVarT "$s" :> tyConZ), [tyConStackAtomZ]
                 , ZephyrSymbolDefinition (ZephyrWord conName)
-                  ( ZephyrTyChecked $
-                    [ TagZ tyRef (fromIntegral conIndex) (V.length argTys) ] ) ) ] ++
-              concatMap genDefinitionsForArg (zip [0..] (V.toList argTys))
+                  ( build $
+                    [ TagZ (Right (ZephyrAskRef 0)) (fromIntegral conIndex) (V.length argTys) ] ) ) ] ++
+              concatMap (genDefinitionsForArg conName) (zip [0..] (V.toList argTys))
 
-          genDefinitionsForArg :: (Int64, GenericZippyField ZephyrScopedTy) -> [(ZephyrEffect ZippyTyVarName, GenericZephyrSymbolDefinition ZephyrTyChecked)]
-          genDefinitionsForArg (i, ZippyUnnamedField _) = []
-          genDefinitionsForArg (i, ZippyNamedField (ZippyDataArgName argName) fieldTy) =
-              [ ( ZephyrEffect tyConZ (ZephyrVarT "$s" :> ZephyrQuoteT (ZephyrEffect (scopedTyToZipper fieldTy) (ZephyrVarT "$s") (ZephyrVarT "$s'"))) (ZephyrVarT "$s'")
-                , ZephyrSymbolDefinition (ZephyrWord ("VISIT-" <> argName))
-                  ( ZephyrTyChecked $
+          genDefinitionsForArg :: T.Text -> (Int64, GenericZippyField ZephyrScopedTy) -> [(ZephyrEffect ZippyTyVarName, [ZephyrT ZephyrStackAtomK ZippyTyVarName], GenericZephyrSymbolDefinition CompiledZephyr)]
+          genDefinitionsForArg _ (i, ZippyUnnamedField _) = []
+          genDefinitionsForArg conName (i, ZippyNamedField (ZippyDataArgName argName) fieldTy) =
+              [ ( ZephyrEffect tyConZ (ZephyrVarT "$s" :> ZephyrQuoteT (ZephyrEffect (scopedTyToZipper fieldTy) (ZephyrVarT "$s") (ZephyrVarT "$s'"))) (ZephyrVarT "$s'"), []
+                , ZephyrSymbolDefinition (ZephyrWord ("VISIT-" <> conName <> "-" <> argName))
+                  ( build $
                     [ IntegerZ i
                     , ZipDownZ
 
@@ -71,9 +80,9 @@ genDefinitionsForType tyRef (ZippyAlgebraicT tyCon cons) = concatMap genDefiniti
 
                     , ZipUpZ ]) )
 
-              , ( ZephyrEffect tyConZ (ZephyrVarT "$s") (ZephyrVarT "$s" :> boolAtomTy)
-                , ZephyrSymbolDefinition (ZephyrWord ("CHK-HOLE-" <> argName))
-                  ( ZephyrTyChecked $
+              , ( ZephyrEffect tyConZ (ZephyrVarT "$s") (ZephyrVarT "$s" :> boolAtomTy), []
+                , ZephyrSymbolDefinition (ZephyrWord ("CHK-HOLE-" <> conName <> "-" <> argName))
+                  ( build $
                     [ ArgHoleZ
                     , IntegerZ i
                     , EqZ ] ) ) ]
@@ -121,63 +130,232 @@ instantiateAllTypes allTypes env types = foldl instantiateType env types
           resolveTyVars tyVars (Global (SimpleFieldT s)) = SimpleFieldT s
           resolveTyVars tyVars (Global (RefFieldT (ZippyTyCon tyName tyArgs))) = RefFieldT (ZephyrInstantiatedType (ZippyTyCon tyName (fmap (resolveTyVars tyVars) tyArgs)))
 
-compilePackages :: [ZephyrPackage] -> ZippyTyCon -> (HM.HashMap ZephyrWord ZephyrProgram, ZippySchema)
+data ZephyrCompileError = ZephyrCompileErrorTy ([ZephyrTyCheckLocation], ZephyrTyCheckError)
+                        | ZephyrCompileErrorGeneric String
+                          deriving Show
+
+newtype ZephyrBeforeAskInference = ZephyrBeforeAskInference [ZephyrBeforeAskInferenceAtom] deriving Show
+type ZephyrBeforeAskInferenceAtom = GenericZephyrAtom (ZephyrT ZephyrStackAtomK ZephyrTyVar) ZephyrBeforeAskInference Int
+
+monomorphicTy :: ZephyrT k var -> ZephyrT k var
+monomorphicTy (ZephyrForAll _ _ x) = monomorphicTy x
+monomorphicTy x = x
+
+existentials :: ZephyrT k var -> [var]
+existentials ty = existentials' ty []
+    where existentials' (ZephyrForAll k v ty) a = existentials' ty (v:a)
+          existentials' _ a = a
+
+instantiateTy :: ZephyrT k ZephyrTyVar -> ZephyrTyCheckM s (ZephyrT k ZephyrTyVar, HM.HashMap ZephyrTyVar ZephyrTyVar)
+instantiateTy ty = instantiateTy' ty mempty
+    where instantiateTy' (ZephyrForAll k v ty) a =
+              do v' <- newTyVar
+                 instantiateTy' (fmap (\var -> if var == v then v' else var) ty) (HM.insert v v' a)
+          instantiateTy' ty a = pure (ty, a)
+
+subVars :: HM.HashMap ZephyrTyVar ZephyrTyVar -> ZephyrT k ZephyrTyVar -> ZephyrT k ZephyrTyVar
+subVars subs ty = fmap doSub ty
+    where doSub var = HM.lookupDefault var var subs
+
+inferAsks :: ZephyrTypeLookupEnv -> ZephyrTypeInstantiationEnv ->
+             [(ZephyrWord, ZephyrWord, ZephyrT ZephyrStackAtomK ZephyrTyVar, OpTypes, [ZephyrT ZephyrStackAtomK ZephyrTyVar], [ZephyrOpComment], ZephyrBeforeAskInference)] ->
+             ([(ZephyrWord, ZephyrWord, ZephyrT ZephyrStackAtomK ZephyrTyVar, [ZephyrT ZephyrStackAtomK ZephyrTyVar], OpTypes, CompiledZephyr)], ZephyrTypeInstantiationEnv)
+inferAsks typeLookupEnv typeInstantiationEnv initialSt =
+    let askInferenceGroups = map resolveSCC $ stronglyConnComp (map (\(i, (_, _, _, _, ops)) -> (i, i, S.toList (referredSyms ops))) allReferredSyms)
+        allReferredSyms = zip [0..] (map (\(_, _, ty, opTypes, asks, comments, ops) -> (ty, opTypes, asks, comments, ops)) initialSt)
+        allReferredSymsMap = HM.fromList allReferredSyms
+
+        resolveSCC (AcyclicSCC v) = [v]
+        resolveSCC (CyclicSCC vs) = vs
+
+        referredSyms (ZephyrBeforeAskInference ops) = mconcat (map symsForOp ops)
+        symsForOp (SymZ _ sym) = S.singleton sym
+        symsForOp (QuoteZ ops) = referredSyms ops
+        symsForOp _ = mempty
+
+        symAsks = foldl inferGroupAsks HM.empty askInferenceGroups
+        inferGroupAsks asks [sym] =
+            let Just (symTy, _, symAsks, symComments, ZephyrBeforeAskInference symOps) = HM.lookup sym allReferredSymsMap
+                -- Now go through the zipped up comments and operations, and find any symz or quotes that have asks
+                inferredAsks = mconcat $ zipWith createAsk symComments symOps
+
+                createAsk (ZephyrSymbolType ty@(ZephyrForAll _ _ _)) (SymZ _ x) = error ("Cannot create asks for expected polymorphic type: " ++ show ty)
+                createAsk (ZephyrSymbolType monoTy) (SymZ _ x)
+                    | x /= sym = let Just (referredTy, _, _, _, _) = HM.lookup x allReferredSymsMap
+                                     Just referredAsks = HM.lookup x asks
+
+                                     Right askTys = runInNewTyCheckM $ do
+                                                      (monoReferredTy, instantiatedVars) <- instantiateTy referredTy
+                                                      mapM_ allocateTyVariable (allTyVariables monoTy)
+                                                      mapM_ allocateTyVariable (allTyVariables monoReferredTy)
+                                                      unifyZephyrT monoTy monoReferredTy
+                                                      referredAsks' <- mapM simplifyZephyrT (map (subVars instantiatedVars) (S.toList referredAsks))
+                                                      trace ("sym ty " ++ ppZephyrTy monoTy ++ " generic: " ++ ppZephyrTy referredTy) (mapM (forceTyVars (allTyVariables symTy)) referredAsks')
+                                 in S.fromList askTys
+                createAsk (ZephyrQuoteComments comments) (QuoteZ (ZephyrBeforeAskInference q)) = mconcat $ zipWith createAsk comments q
+                createAsk _ _ = mempty
+
+                asks' = HM.insert sym (S.fromList symAsks <> inferredAsks) asks
+            in asks'
+
+        (res, typeInstantiationEnv') = runState (mapM compileSymbol (zip [0..] initialSt)) typeInstantiationEnv
+
+        compileSymbol (i, (pkg, symName, symTy, symOpTypes, _, symComments, symOps)) =
+            case HM.lookup i symAsks of
+              Nothing -> error "Cannot find symbol"
+              Just asks ->
+                  let boundInTy = S.fromList (existentials symTy)
+                      askHasBoundVariables ty = any (`S.member` boundInTy) (allTyVariables ty)
+                      asks' = S.filter askHasBoundVariables asks
+
+                      asksList = S.toList asks'
+                      askToAskIndex = M.fromList (zip asksList [0..])
+
+                      compileOps :: [ZephyrOpComment] -> ZephyrBeforeAskInference -> State ZephyrTypeInstantiationEnv CompiledZephyr
+                      compileOps comments (ZephyrBeforeAskInference ops) = trace ("Compile " ++ show ops ++ " with comments " ++ show comments)
+                                                                           (CompiledZephyr . V.fromList . mconcat <$> mapM (uncurry compileOp) (zip comments ops))
+
+                      compileOp (ZephyrSymbolType monoTy) (SymZ _ x) =
+                          do let Just (referredTy, _, _, _, _) = HM.lookup x allReferredSymsMap
+                                 Just referredAsks = HM.lookup x symAsks
+
+                                 askTyRes = trace ("XXXXXXXXXXXX Going to unify " ++ ppZephyrTy monoTy ++ " with " ++ ppZephyrTy referredTy) $
+                                            runInNewTyCheckM $ do
+                                              (monoReferredTy, instantiatedVars) <- instantiateTy referredTy
+                                              mapM_ allocateTyVariable (allTyVariables monoTy)
+                                              mapM_ allocateTyVariable (allTyVariables monoReferredTy)
+                                              unifyZephyrT monoTy monoReferredTy
+                                              referredAsks' <- mapM simplifyZephyrT (map (subVars instantiatedVars) (S.toList referredAsks))
+                                              mapM (forceTyVars (allTyVariables symTy)) referredAsks'
+
+                                 resolveAsk fullTy@(ZephyrZipperT ty)
+                                   | null (allTyVariables fullTy) =
+                                       do env <- get
+                                          let (tyRef, env') = internType typeLookupEnv env (zephyrTyToInstantiatedTy ty)
+                                          put env'
+                                          pure (Left tyRef)
+                                   | otherwise = case M.lookup fullTy askToAskIndex of
+                                                   Just i -> pure (Right (ZephyrAskRef i))
+                                                   Nothing -> error ("Could not answer ask for symbol " ++ show i ++ ". Looking for " ++ show fullTy ++ ". Have " ++ show askToAskIndex ++ ". Likely an ambiguous variable")
+                                 resolveAsk _ = error "bad type form in ask"
+                             case askTyRes of
+                               Right askTys -> do resolvedAsks <- mapM resolveAsk askTys
+                                                  pure [ SymZ (V.fromList resolvedAsks) x ]
+                               Left err -> error ("Error resolving types: " ++ show err)
+
+                      compileOp (ZephyrQuoteComments comments) (QuoteZ ops) = do op <- QuoteZ <$> compileOps comments ops
+                                                                                 pure [op, DupAnswerZ]
+                      compileOp comment (QuoteZ q) = error ("Got quote but no comment? " ++ show comment ++ ". Symbols are " ++ show q)
+                      compileOp _ op = pure [mapAsk (error "unsupported ask") . mapQuote (error "unsupported quote") $ op]
+                  in (pkg, symName, symTy, asksList, symOpTypes,) <$> compileOps symComments symOps
+
+    in trace ("Inferring in " ++ intercalate "\n" (zipWith (\i sym -> show i ++ ": " ++ show sym) [0..] initialSt)) $
+       trace ("Ask groups: " ++ show askInferenceGroups) $
+       trace (" and ask map: " ++ show (HM.toList symAsks)) (res, typeInstantiationEnv')
+
+compilePackages :: [ZephyrPackage] -> ZippyTyCon -> Either ZephyrCompileError (HM.HashMap ZephyrWord ZephyrProgram, ZippySchema)
 compilePackages pkgs rootTy =
     let allTypes = tyEnvFromList allTypesList
         allTypesList = map (qualifyConArgTypes allTypes) (concatMap zephyrTypes pkgs)
 
-        definitions = concatMap (\ty@(ZippyAlgebraicT (ZippyTyCon (ZippyTyName pkg _) _) _) -> map (pkg,) $
-                                                                                               genDefinitionsForType (ZippyTyRef 0) ty) allTypesList
+        uninstantiatedDefs = concatMap (\ty@(ZippyAlgebraicT (ZippyTyCon (ZippyTyName pkg _) _) _) -> map (pkg,) $
+                                                                                                      genDefinitionsForType (ZippyTyRef 0) ty) allTypesList
+
+        instantiateDef :: (T.Text, (ZephyrEffect ZippyTyVarName, [ZephyrT ZephyrStackAtomK ZippyTyVarName], GenericZephyrSymbolDefinition CompiledZephyr)) ->
+                          ZephyrTyCheckM s (T.Text, (ZephyrT ZephyrStackAtomK ZephyrTyVar, [ZephyrT ZephyrStackAtomK ZephyrTyVar], GenericZephyrSymbolDefinition CompiledZephyr))
+        instantiateDef (pkg, (ty, asks, def)) =
+            do let tyVars = allTyVariables ty
+               instantiatedVars <- HM.fromList <$> mapM (\tyVar -> (tyVar,) <$> newTyVar) tyVars
+               let ty' = fmap (fromJust . flip HM.lookup instantiatedVars) ty
+                   asks' = map (fmap (fromJust . flip HM.lookup instantiatedVars)) asks
+               genTy <- generalizeType ty'
+               pure (pkg, (genTy, asks', def))
 
         tyInstantiationEnv = foldl (\env pkg -> instantiateAllTypes allTypes env (zephyrTypes pkg)) emptyZephyrTypeInstantiationEnv pkgs
-        tyChecked = trace ("Got definitions " ++ show definitions) $
+        tyChecked = trace ("Got definitions " ++ show uninstantiatedDefs) $
                     runInNewTyCheckM $ do
-                      pretypedSymbols <- buildSymbolEnv <$>
-                                         mapM (\(pkgName, (ty, ZephyrSymbolDefinition symName _)) -> ((ZephyrWord pkgName, symName),) <$> instantiate (ZephyrEffectWithNamedVars ty)) definitions
-                      tyCheckPackages pretypedSymbols allTypes pkgs
+                      definitions <- mapM instantiateDef uninstantiatedDefs
+                      let pretypedSymbols = buildSymbolEnv $
+                                            map (\(pkgName, (ty, _, ZephyrSymbolDefinition symName _)) -> ((ZephyrWord pkgName, symName), ty)) definitions
+                      tyCheckedPkgs <- tyCheckPackages pretypedSymbols allTypes pkgs
 
-        showError (locs, err) = "At " ++ show locs ++ ":\n" ++ showError' err
-        showError' (KindMismatch ty1 ty2) = "Kind mismatch between " ++ show (kindOf ty1) ++ " and " ++ show (kindOf ty2) ++ " " ++ show ty1 ++ " " ++ show ty2
-        showError' x = show x
-    in trace ("Type checked " ++ either (("ERROR\n" ++) . showError) show tyChecked ++ ". With types " ++ show tyInstantiationEnv) undefined
+                      let (schema, symEnv, symTbl') = compileSymbolTable tyCheckedPkgs definitions
+                          exportedSymbols = concatMap (\pkg -> map (zephyrPackageName pkg,) (zephyrExports pkg)) tyCheckedPkgs
 
+                          programs = mapM (\(pkgName, sym) -> (sym,) <$> lookupInSymbolEnv (Right (pkgName, sym)) symEnv) exportedSymbols
+                          symTbl = fmap (\(_, _, sym) -> sym) symTbl'
 
-    --     namesToInts = HM.fromList (zip names [0..])
-    --     qualifiedSymbols = mconcat (map (\pkg -> map (zephyrPackageName pkg,) (zephyrSymbols pkg ++ concatMap genDefinitionsForType' (zephyrTypes pkg))) pkgs)
-    --     symbols = map snd qualifiedSymbols
-    --     names = map zephyrSymbolName symbols
+                      generateJitEndpoints symEnv symTbl'
 
-    --     resolveSymbol symbol = fromJust (HM.lookup symbol namesToInts <|> error ("Cannot find " ++ show symbol))
+                      case programs of
+                        Nothing -> pure (Left (ZephyrCompileErrorGeneric ("could not find exported symbols: " ++ show exportedSymbols)))
+                        Just programs -> do let programs' = map (\(sym, index) -> (sym, ZephyrProgram index symTbl)) programs
+--                                            trace ("Got asks: " ++ show inferredAsks) $ Right (HM.fromList programs', schema)
 
-    --     compiled = map compiledSymbol symbols
-    --     compiledSymbol (ZephyrSymbolDefinition _ builder) = compiledBuilder builder
-    --     compiledBuilder (ZephyrTyChecked d) =
-    --         let shallowResolved = map (fmap resolveSymbol) d
-    --             resolved = map (mapQuote compiledBuilder) shallowResolved
-    --         in CompiledZephyr . V.fromList $ resolved
+                                            pure (Right (HM.fromList programs', schema))
 
-    --     qualifiedWords = map (uncurry ZephyrQualifiedWord . second zephyrSymbolName ) qualifiedSymbols
+        compileSymbolTable tyCheckedPkgs definitions =
+            let (rootTyRef, tyInstantiationEnv'') = internType allTypes tyInstantiationEnv' instantiatedRootTy
+                instantiatedRootTy = ZephyrInstantiatedType $ fmap instantiateTy rootTy
+                instantiateTy _ = error "root type must be 0-arity"
 
-    --     allInstantiatedTypes = collectInstantiatedTypes allTypes
-    --     tyToTyRef :: M.Map (GenericZippyTyCon (ZippyFieldType RecZippyTyCon)) ZippyTyRef
-    --     tyToTyRef = M.fromList $
-    --                 zip (map (\(ZippyAlgebraicT qTy _) -> qTy) allInstantiatedTypes) (map ZippyTyRef [0..])
+                schema = ZippySchema rootTyRef (V.fromList (getTypesAsZippyT allTypes tyInstantiationEnv''))
 
-    --     Just rootTy = M.lookup (ZippyTyCon (qualifyTy rootTyName allTypes) V.empty) tyToTyRef
-    --     schema = let lookupFieldTy (SimpleFieldT s) = SimpleFieldT s
-    --                  lookupFieldTy (RefFieldT ty) =
-    --                      case M.lookup (unRecTy ty) tyToTyRef of
-    --                        Just x -> RefFieldT x
-    --                        Nothing -> error ("Could not find instantiation of " ++ show ty)
-    --              in ZippySchema rootTy (V.fromList (map (AlgebraicT . mapZippyAlgebraicT lookupFieldTy lookupFieldTy) allInstantiatedTypes))
+                resolvedSymbols = concatMap (\pkg -> map (\(ZephyrSymbolDefinition symName (ty, opComments, opTypes, def)) -> (zephyrPackageName pkg, symName, (ty, opComments, opTypes, resolveDef def))) (zephyrSymbols pkg)) tyCheckedPkgs
 
-    --     genDefinitionsForType' ty@(ZippyAlgebraicT qTy _) =
-    --         --let Just tyRef = HM.lookup qTy tyToTyRef
-    --         {-in-} genDefinitionsForType (ZippyTyRef 0) {- TODO How do we figure out the type reference if we don't know what the types are until run-time? -} ty
+                allSymbolNames = map (\(pkg, symName, _) -> (pkg, symName)) resolvedSymbols ++
+                                 map (\(pkg, (_, _, ZephyrSymbolDefinition symName _)) -> (ZephyrWord pkg, symName)) definitions
 
-    --     allExports = concatMap zephyrExports pkgs
-    --     progs = HM.fromList $
-    --             map (\export -> (export, ZephyrProgram (fromJust (HM.lookup export namesToInts)) symbolTbl)) allExports
+                symEnv = buildSymbolEnv (zip allSymbolNames [0..])
 
-    --     symbolTbl = V.fromList (zipWith CompiledZephyrSymbol qualifiedWords compiled)
-    -- in (progs, schema)
+                (inferredAsks, tyInstantiationEnv') = inferAsks allTypes tyInstantiationEnv initialAsks
+                initialAsks = map (\(pkg, symName, (ty, comments, opTypes, def)) -> (pkg, symName, ty, UserDefined opTypes, [], comments, def)) resolvedSymbols ++
+                              map (\(pkg, (ty, asks, ZephyrSymbolDefinition symName _)) -> (ZephyrWord pkg, symName, ty, Builtin, asks, [], ZephyrBeforeAskInference [])) definitions
+
+                symTbl' = V.fromList (map (\(pkg, symName, symTy, _, opTypes, compiled) -> (symTy, opTypes, CompiledZephyrSymbol (ZephyrQualifiedWord pkg symName) compiled)) inferredAsks ++
+                                      map (\(pkg, (ty, _, ZephyrSymbolDefinition symName def)) -> (ty, Builtin, CompiledZephyrSymbol (ZephyrQualifiedWord (ZephyrWord pkg) symName) def)) definitions)
+                resolveDef (ZephyrTyChecked atoms) =
+                    ZephyrBeforeAskInference $ map (mapQuote resolveDef . fmap resolveSymbol) atoms
+                resolveSymbol sym = case lookupInSymbolEnv (Left sym) symEnv of
+                                      Nothing -> error ("Could not find symbol " ++ show sym)
+                                      Just i -> i
+            in (schema, symEnv, symTbl')
+
+    in case tyChecked of
+         Left err -> Left (ZephyrCompileErrorTy err)
+         Right res -> res
+         -- Left err -> Left (ZephyrCompileErrorTy err)
+         -- Right (tyCheckedPkgs, definitions) ->
+         --     let (rootTyRef, tyInstantiationEnv'') = internType allTypes tyInstantiationEnv' instantiatedRootTy
+         --         instantiatedRootTy = ZephyrInstantiatedType $ fmap instantiateTy rootTy
+         --         instantiateTy _ = error "root type must be 0-arity"
+
+         --         schema = ZippySchema rootTyRef (V.fromList (getTypesAsZippyT allTypes tyInstantiationEnv''))
+
+         --         resolvedSymbols = concatMap (\pkg -> map (\(ZephyrSymbolDefinition symName (ty, opComments, opTypes, def)) -> (zephyrPackageName pkg, symName, (ty, opComments, opTypes, resolveDef def))) (zephyrSymbols pkg)) tyCheckedPkgs
+
+         --         allSymbolNames = map (\(pkg, symName, _) -> (pkg, symName)) resolvedSymbols ++
+         --                          map (\(pkg, (_, _, ZephyrSymbolDefinition symName _)) -> (ZephyrWord pkg, symName)) definitions
+
+         --         symEnv = buildSymbolEnv (zip allSymbolNames [0..])
+
+         --         (inferredAsks, tyInstantiationEnv') = inferAsks allTypes tyInstantiationEnv initialAsks
+         --         initialAsks = map (\(pkg, symName, (ty, comments, opTypes, def)) -> (pkg, symName, ty, UserDefined opTypes, [], comments, def)) resolvedSymbols ++
+         --                       map (\(pkg, (ty, asks, ZephyrSymbolDefinition symName _)) -> (ZephyrWord pkg, symName, ty, Builtin, asks, [], ZephyrBeforeAskInference [])) definitions
+
+         --         symTbl' = V.fromList (map (\(pkg, symName, symTy, opTypes, compiled) -> (symTy, opTypes, CompiledZephyrSymbol (ZephyrQualifiedWord pkg symName) compiled)) inferredAsks ++
+         --                               map (\(pkg, (ty, _, ZephyrSymbolDefinition symName def)) -> (ty, Builtin, CompiledZephyrSymbol (ZephyrQualifiedWord (ZephyrWord pkg) symName) def)) definitions)
+         --         symTbl = fmap (\(_, _, sym) -> sym) symTbl'
+         --         resolveDef (ZephyrTyChecked atoms) =
+         --             ZephyrBeforeAskInference $ map (mapQuote resolveDef . fmap resolveSymbol) atoms
+         --         resolveSymbol sym = case lookupInSymbolEnv (Left sym) symEnv of
+         --                               Nothing -> error ("Could not find symbol " ++ show sym)
+         --                               Just i -> i
+
+         --         exportedSymbols = concatMap (\pkg -> map (zephyrPackageName pkg,) (zephyrExports pkg)) tyCheckedPkgs
+
+         --         programs = mapM (\(pkgName, sym) -> (sym,) <$> lookupInSymbolEnv (Right (pkgName, sym)) symEnv) exportedSymbols
+         --     in case programs of
+         --          Nothing -> Left (ZephyrCompileErrorGeneric ("could not find exported symbols: " ++ show exportedSymbols))
+         --          Just programs -> let programs' = map (\(sym, index) -> (sym, ZephyrProgram index symTbl)) programs
+         --                           in trace ("Got asks: " ++ show inferredAsks) $ Right (HM.fromList programs', schema)

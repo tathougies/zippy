@@ -1,4 +1,5 @@
-{-# LANGUAGE DeriveFunctor, DeriveTraversable, DeriveFoldable, TypeFamilies, ScopedTypeVariables, RankNTypes #-}
+{-# LANGUAGE DeriveFunctor, DeriveTraversable, DeriveFoldable, TypeFamilies, ScopedTypeVariables, RankNTypes, FlexibleContexts, UndecidableInstances #-}
+{-# OPTIONS_GHC -funbox-strict-fields #-}
 module Database.Zippy.Zephyr.Types where
 
 import Database.Zippy.Types
@@ -24,19 +25,20 @@ import Data.Text (Text)
 import Data.ByteString (ByteString)
 import qualified Data.HashMap.Strict as HM
 import qualified Data.Set as S
+import qualified Data.Map as M
 
 import Text.Parsec.Pos (SourcePos)
 
 import Unsafe.Coerce
 
-data GenericZephyrAtom quote sym =
+data GenericZephyrAtom tyRef quote sym =
     IntegerZ !Int64
   | FloatingZ !Double
   | TextZ !Text
   | BinaryZ !ByteString
 
   | QuoteZ !quote
-  | SymZ !sym
+  | SymZ (Vector tyRef) !sym
 
   | ZipUpZ
   | ZipDownZ
@@ -59,8 +61,11 @@ data GenericZephyrAtom quote sym =
   | IfThenElseZ
   | LengthZ
 
+  | RandomZ
+
   | FailZ
   | LogZ
+  | TraceZ
   | YieldZ
 
   | EqZ
@@ -68,7 +73,10 @@ data GenericZephyrAtom quote sym =
   | GtZ
   | PlusZ
 
-  | TagZ !ZippyTyRef !Word16 !Int
+  | AnswerZ (Vector tyRef)
+  | DupAnswerZ
+
+  | TagZ !tyRef !Word16 !Int
     deriving (Show, Functor)
 
 data GenericZephyrSymbolDefinition zephyr =
@@ -77,17 +85,25 @@ data GenericZephyrSymbolDefinition zephyr =
 
 zephyrSymbolName :: GenericZephyrSymbolDefinition zephyr -> ZephyrWord
 zephyrSymbolName (ZephyrSymbolDefinition name _) = name
+zephyrSymbolDefinition :: GenericZephyrSymbolDefinition zephyr -> zephyr
+zephyrSymbolDefinition (ZephyrSymbolDefinition _ def) = def
 
-data ZephyrProgram =
+data GenericZephyrProgram a =
     ZephyrProgram
     { zephyrEntry     :: !Int
-    , zephyrSymbolTbl :: !(Vector CompiledZephyrSymbol) }
+    , zephyrSymbolTbl :: !(Vector a) }
     deriving Show
+type ZephyrProgram = GenericZephyrProgram CompiledZephyrSymbol
 
 data ZephyrQualifiedWord = ZephyrQualifiedWord !ZephyrWord !ZephyrWord
                            deriving Show
 
-type CompiledZephyrAtom = GenericZephyrAtom CompiledZephyr Int
+newtype ZephyrAskRef = ZephyrAskRef Int deriving (Show, Read, Eq, Ord)
+
+zephyrAskRefIndex :: ZephyrAskRef -> Int
+zephyrAskRefIndex (ZephyrAskRef i) = i
+
+type CompiledZephyrAtom = GenericZephyrAtom (Either ZippyTyRef ZephyrAskRef) CompiledZephyr Int
 newtype CompiledZephyr = CompiledZephyr (Vector CompiledZephyrAtom)
     deriving Show
 data CompiledZephyrSymbol = CompiledZephyrSymbol !ZephyrQualifiedWord !CompiledZephyr deriving Show
@@ -97,27 +113,27 @@ newtype ZephyrWord = ZephyrWord Text deriving (Show, Eq, Ord, IsString, Hashable
 data SourceRange = SourceRange !SourcePos !SourcePos
                    deriving Show
 
-type ZephyrBuilderAtom = GenericZephyrAtom ZephyrBuilder ZephyrWord
+type ZephyrBuilderAtom = GenericZephyrAtom (ZephyrT ZephyrStackAtomK ZippyTyVarName) ZephyrBuilder ZephyrWord
 data ZephyrBuilderOp = ZephyrStateAssertion !(ZephyrExecState ZippyTyVarName) !SourceRange
                      | ZephyrAtom !ZephyrBuilderAtom !SourceRange
                        deriving Show
 newtype ZephyrBuilder = ZephyrBuilder (DList ZephyrBuilderOp)
     deriving (Show, Monoid)
 
-type ZephyrTyCheckedAtom = GenericZephyrAtom ZephyrTyChecked ZephyrWord
+type ZephyrTyCheckedAtom = GenericZephyrAtom (ZephyrT ZephyrStackAtomK ZephyrTyVar) ZephyrTyChecked ZephyrWord
 newtype ZephyrTyChecked = ZephyrTyChecked [ZephyrTyCheckedAtom]
     deriving Show
 
 symbolBytecode :: CompiledZephyrSymbol -> Vector CompiledZephyrAtom
 symbolBytecode (CompiledZephyrSymbol _ (CompiledZephyr bc)) = bc
 
-mapQuote :: (q -> q') -> GenericZephyrAtom q a -> GenericZephyrAtom q' a
+mapQuote :: (q -> q') -> GenericZephyrAtom ask q a -> GenericZephyrAtom ask q' a
 mapQuote f (QuoteZ q) = QuoteZ (f q)
 mapQuote _ (IntegerZ i) = IntegerZ i
 mapQuote _ (FloatingZ d) = FloatingZ d
 mapQuote _ (TextZ t) = TextZ t
 mapQuote _ (BinaryZ b) = BinaryZ b
-mapQuote _ (SymZ s) = SymZ s
+mapQuote _ (SymZ a s) = SymZ a s
 mapQuote _ ZipUpZ = ZipUpZ
 mapQuote _ ZipDownZ = ZipDownZ
 mapQuote _ ZipReplaceZ = ZipReplaceZ
@@ -136,14 +152,56 @@ mapQuote _ DeQuoteZ = DeQuoteZ
 mapQuote _ DipZ = DipZ
 mapQuote _ IfThenElseZ = IfThenElseZ
 mapQuote _ LengthZ = LengthZ
+mapQuote _ RandomZ = RandomZ
 mapQuote _ FailZ = FailZ
 mapQuote _ LogZ = LogZ
+mapQuote _ TraceZ = TraceZ
 mapQuote _ YieldZ = YieldZ
 mapQuote _ EqZ = EqZ
 mapQuote _ LtZ = LtZ
 mapQuote _ GtZ = GtZ
 mapQuote _ PlusZ = PlusZ
 mapQuote _ (TagZ ty tag argCnt) = TagZ ty tag argCnt
+mapQuote _ (AnswerZ a) = AnswerZ a
+mapQuote _ DupAnswerZ = DupAnswerZ
+
+mapAsk :: (ask -> ask') -> GenericZephyrAtom ask q a -> GenericZephyrAtom ask' q a
+mapAsk _ (QuoteZ q) = QuoteZ q
+mapAsk _ (IntegerZ i) = IntegerZ i
+mapAsk _ (FloatingZ d) = FloatingZ d
+mapAsk _ (TextZ t) = TextZ t
+mapAsk _ (BinaryZ b) = BinaryZ b
+mapAsk f (SymZ a s) = SymZ (fmap f a) s
+mapAsk _ ZipUpZ = ZipUpZ
+mapAsk _ ZipDownZ = ZipDownZ
+mapAsk _ ZipReplaceZ = ZipReplaceZ
+mapAsk _ CurTagZ = CurTagZ
+mapAsk _ CurAtomZ = CurAtomZ
+mapAsk _ ArgHoleZ = ArgHoleZ
+mapAsk _ EnterZipperZ = EnterZipperZ
+mapAsk _ CutZ = CutZ
+mapAsk _ SwapZ = SwapZ
+mapAsk _ DupZ = DupZ
+mapAsk _ ZapZ = ZapZ
+mapAsk _ CatZ = CatZ
+mapAsk _ ConsZ = ConsZ
+mapAsk _ UnConsZ = UnConsZ
+mapAsk _ DeQuoteZ = DeQuoteZ
+mapAsk _ DipZ = DipZ
+mapAsk _ IfThenElseZ = IfThenElseZ
+mapAsk _ LengthZ = LengthZ
+mapAsk _ RandomZ = RandomZ
+mapAsk _ FailZ = FailZ
+mapAsk _ LogZ = LogZ
+mapAsk _ TraceZ = TraceZ
+mapAsk _ YieldZ = YieldZ
+mapAsk _ EqZ = EqZ
+mapAsk _ LtZ = LtZ
+mapAsk _ GtZ = GtZ
+mapAsk _ PlusZ = PlusZ
+mapAsk f (TagZ askRef tag argCnt) = TagZ (f askRef) tag argCnt
+mapAsk f (AnswerZ a) = AnswerZ (fmap f a)
+mapAsk _ DupAnswerZ = DupAnswerZ
 
 -- * Program execution
 
@@ -155,7 +213,7 @@ data ZephyrEvalError = CatZExpectsTwoQuotes
                      | ConditionMustReturn0Or1
                      | CurHasNoTag
                      | CurIsNotAtom
-                     | ExpectingTwoIntegersForArithmetic
+                     | ExpectingTwoIntegersForArithmetic ZephyrStack
                      | ZipDownNeeds1Argument
                      | EnterZipperExpects1Zipper
                      | CannotYieldNonZipper
@@ -166,19 +224,21 @@ data ZephyrEvalError = CatZExpectsTwoQuotes
 type ZephyrStack = [ZephyrD]
 data ZephyrContinuation = JustContinue !(Vector CompiledZephyrAtom)
                         | PushAndContinue !ZephyrD !(Vector CompiledZephyrAtom)
-                        | IfThenElseAndContinue !(Vector CompiledZephyrAtom) !(Vector CompiledZephyrAtom)
+                        | IfThenElseAndContinue !(Vector CompiledZephyrAtom) !(Vector ZippyTyRef) !(Vector CompiledZephyrAtom) !(Vector ZippyTyRef)
                         | ExitZipper !(Vector CompiledZephyrAtom)
+                        | PopAnswer
                           deriving Show
 data ZephyrContext = ZephyrContext
                    { zephyrContinuations :: [ZephyrContinuation]
                    , zephyrStack         :: ZephyrStack
-                   , zephyrZippers       :: [Zipper] }
+                   , zephyrZippers       :: [Zipper]
+                   , zephyrAsksStack     :: [Vector ZippyTyRef] }
                      deriving Show
 
 data ZephyrD where
     ZephyrD :: !(ZippyD InMemory Atom a) -> ZephyrD
     ZephyrZ :: Zipper -> ZephyrD
-    ZephyrQ :: !(Vector CompiledZephyrAtom) -> ZephyrD
+    ZephyrQ :: !(Vector CompiledZephyrAtom) -> !(Vector ZippyTyRef) -> ZephyrD
 deriving instance Show ZephyrD
 
 type ZephyrExports = HM.HashMap ZephyrWord ZephyrProgram
@@ -297,6 +357,8 @@ data ZephyrT (k :: ZephyrKind) tyVar where
 
     ZephyrStackBottomT ::  ZephyrT ZephyrStackK tyVar
     (:>) :: (IsStackAtomKind stackAtom ~ True, IsKind stackAtom) => ZephyrT ZephyrStackK tyVar -> ZephyrT stackAtom tyVar -> ZephyrT ZephyrStackK tyVar
+
+    ZephyrForAll :: ZephyrKind -> tyVar -> ZephyrT k tyVar -> ZephyrT k tyVar
 deriving instance Show tyVar => Show (ZephyrT k tyVar)
 
 zipperKindedZephyrZipper :: ZippyFieldType (RecZephyrType tyVar) -> ZephyrT ZephyrZipperK tyVar
@@ -322,7 +384,38 @@ instance Eq tyVar => Eq (ZephyrT k tyVar) where
     ZephyrStackBottomT == ZephyrStackBottomT = True
     (aStk :> ZephyrZipperT aAtom) == (bStk :> ZephyrZipperT bAtom) = aAtom == bAtom && aStk == bStk
     (aStk :> ZephyrQuoteT aAtom) == (bStk :> ZephyrQuoteT bAtom) = aAtom == bAtom && aStk == bStk
+    ZephyrForAll k1 v1 t1 == ZephyrForAll k2 v2 t2 = undefined
     _ == _ = False
+
+instance Ord tyVar => Ord (ZephyrT k tyVar) where
+    compare ZephyrStackBottomT ZephyrStackBottomT = EQ
+    compare (ZephyrVarT a) (ZephyrVarT b) = compare a b
+    compare (ZephyrZipperT a) (ZephyrZipperT b) = compare a b
+    compare (ZephyrQuoteT a) (ZephyrQuoteT b) = compare a b
+    compare (a :> ZephyrZipperT aAtom) (b :> ZephyrZipperT bAtom)
+            | a == b = compare aAtom bAtom
+            | otherwise = compare a b
+    compare (a :> ZephyrQuoteT aAtom) (b :> ZephyrQuoteT bAtom)
+            | a == b = compare aAtom bAtom
+            | otherwise = compare a b
+    compare (ZephyrForAll k1 v1 t1) (ZephyrForAll k2 v2 t2) = compare (k1, v1, t1) (k2, v2, t2)
+    compare ZephyrStackBottomT _ = LT
+    compare _ ZephyrStackBottomT = GT
+    compare (ZephyrVarT _) _ = LT
+    compare _ (ZephyrVarT _) = GT
+    compare (ZephyrZipperT _) _ = LT
+    compare _ (ZephyrZipperT _) = GT
+    compare (ZephyrQuoteT _) _ = LT
+    compare _ (ZephyrQuoteT _) = GT
+    compare (a :> aAtom) _ = LT
+    compare _ (b :> bAtom) = GT
+    compare (ZephyrForAll k _ _) _ = LT
+    compare _ (ZephyrForAll k _ _) = GT
+
+instance Ord tyVar => Ord (ZephyrEffect tyVar) where
+    compare (ZephyrEffect aZ aStkBef aStkAfter) (ZephyrEffect bZ bStkBef bStkAfter)
+        | aZ == bZ = if aStkBef == bStkBef then compare aStkAfter bStkAfter else compare aStkBef bStkBef
+        | otherwise = compare aZ bZ
 
 instance Functor (ZephyrT k) where
     fmap f (ZephyrVarT v) = ZephyrVarT (f v)
@@ -331,6 +424,7 @@ instance Functor (ZephyrT k) where
     fmap f (ZephyrQuoteT eff) = ZephyrQuoteT (fmap f eff)
     fmap _ ZephyrStackBottomT = ZephyrStackBottomT
     fmap f (stk :> atom) = fmap f stk :> fmap f atom
+    fmap f (ZephyrForAll k v t) = ZephyrForAll k (f v) (fmap f t)
 
 instance Traversable (ZephyrT k) where
     traverse f (ZephyrVarT v) = ZephyrVarT <$> f v
@@ -339,6 +433,7 @@ instance Traversable (ZephyrT k) where
     traverse f (ZephyrQuoteT eff) = ZephyrQuoteT <$> traverse f eff
     traverse _ ZephyrStackBottomT = pure ZephyrStackBottomT
     traverse f (stk :> atom) = (:>) <$> traverse f stk <*> traverse f atom
+    traverse f (ZephyrForAll k v ty) = ZephyrForAll k <$> f v <*> traverse f ty
 
 instance Foldable (ZephyrT k) where
     foldMap f (ZephyrVarT v) = f v
@@ -347,22 +442,34 @@ instance Foldable (ZephyrT k) where
     foldMap f (ZephyrQuoteT eff) = foldMap f eff
     foldMap _ ZephyrStackBottomT = mempty
     foldMap f (stk :> atom) = foldMap f stk <> foldMap f atom
+    foldMap f (ZephyrForAll k v ty) = f v <> foldMap f ty
 
 type RecZephyrType tyVar = GenericZippyTyCon (ZephyrT ZephyrZipperK tyVar)
 infixl 7 :>
 
 data ZephyrEffect tyVar = ZephyrEffect (ZephyrT ZephyrZipperK tyVar) (ZephyrT ZephyrStackK tyVar) (ZephyrT ZephyrStackK tyVar)
-                          deriving (Show, Eq, Functor, Traversable, Foldable)
+                               deriving (Show, Eq, Functor, Traversable, Foldable)
 
 newtype ZephyrTyVar = ZephyrTyVar Int
     deriving (Show, Eq, Ord, Hashable)
 
 newtype ZephyrEffectWithNamedVars = ZephyrEffectWithNamedVars (ZephyrEffect ZippyTyVarName)
 
-allTyVariables :: Traversable f => f ZippyTyVarName -> [ZippyTyVarName]
-allTyVariables eff = S.toList (execWriter (mapM collectName eff) :: S.Set ZippyTyVarName)
-    where collectName :: ZippyTyVarName -> Writer (S.Set ZippyTyVarName) ()
+allTyVariables :: (Traversable f, Ord a) => f a -> [a]
+allTyVariables (eff :: f a) = S.toList (execWriter (mapM collectName eff))
+    where collectName :: a -> Writer (S.Set a) ()
           collectName name = tell (S.singleton name)
+
+kindedVariables :: Ord v => ZephyrT k v -> M.Map v ZephyrKind
+kindedVariables t = go t
+    where go :: Ord v => ZephyrT k v -> M.Map v ZephyrKind
+          go ty@(ZephyrVarT v) = M.singleton v (kindOf ty)
+          go (ZephyrZipperT (SimpleFieldT _)) = mempty
+          go (ZephyrZipperT (RefFieldT field)) = foldMap go field
+          go (ZephyrQuoteT (ZephyrEffect stk bef aft)) = go stk <> go bef <> go aft
+          go ZephyrStackBottomT = mempty
+          go (a :> b) = go a <> go b
+          go (ZephyrForAll k v ty) = go ty
 
 -- * HasSourceRange class and instances
 

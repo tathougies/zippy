@@ -36,6 +36,7 @@ import qualified Data.Vector as V
 
 import System.IO hiding (char8)
 import System.Log.Logger
+import System.Random
 
 data TxLogVerificationResult = TxLogVerified !InMemoryD
                              | TxLogVerificationFails
@@ -331,6 +332,9 @@ interpretTxSync' !st (Free (ParentArgHoleTx next)) =
     interpretTxSync' st (next (zipperParentArgHole (curZipperCursor st)))
 interpretTxSync' !st (Free (CurTyTx next)) =
     interpretTxSync' st (next (zipperCurType (curZipperCursor st), curSchema st))
+interpretTxSync' !st (Free (RandomTx next)) =
+    do r <- randomIO
+       interpretTxSync' st (next r)
 
 -- | Interprets a Tx monad by sending all requests to the transaction coordinator.
 --   This means that the transaction coordinator is always up-to-date and can enforce
@@ -443,6 +447,9 @@ interpretTxAsync' !settings !st (Free (MoveOOBTx zipper mvmt next)) =
 interpretTxAsync' !settings !st (Free (LogActionTx act next)) =
     do asyncLogAction settings act
        interpretTxAsync' settings st next
+interpretTxAsync' !settings !st (Free (RandomTx next)) =
+    do r <- randomIO
+       interpretTxAsync' settings st (next r)
 
 -- | The asynchronous interpreter is like the synchronous one, except it also keeps track of
 --   a copy of the disk cache. It uses that copy to quickly respond to read requests. When

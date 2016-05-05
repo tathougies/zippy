@@ -13,6 +13,10 @@ DATA Bool ==
   CONS False
   CONS True
 
+DATA Maybe a ==
+  CONS Nothing
+  CONS Just fromJust=a
+
 DEFINE int-compare ==
   { We now have the following on the stack a b. Return 0 if a == b, -1 if a < b, 1 if a > b }
   [ DUP ] DIP SWAP { copy the a b in order to the top of the stack }
@@ -28,7 +32,7 @@ DEFINE int-compare ==
   ]
   IFTE
 
-
+{
 DEFINE switch ==
   [ DUP null? ]
   [ "No cases matched" FAIL ]
@@ -59,8 +63,8 @@ DEFINE switch ==
     [ ZAP switch ]
     IFTE
   ]
-  IFTE
-
+  IFTE}
+{
 DEFINE null? ==
   LENGTH 0 ==
 
@@ -79,7 +83,7 @@ DEFINE repeat-n ==
     SWAP
     repeat-n
   ]
-  IFTE
+  IFTE}
 
 DEFINE max ==
   [ [ DUP ] DIP SWAP
@@ -89,10 +93,11 @@ DEFINE max ==
   [ [ ZAP ] DIP ]
   IFTE
 
+{
 DEFINE replicate-n ==
   [ [ DUP 0 == ] DIP SWAP ]
   [ ZAP ZAP ]
   [ [ -1 + ] DIP
     DUP
     [ SWAP [ I ] DIP ] DIP ]
-  IFTE
+  IFTE}

@@ -12,35 +12,47 @@ import Control.Monad
 import Data.Maybe
 import Data.Int
 import Data.Vector (Vector)
+import Data.Monoid (mempty, (<>))
 import qualified Data.Vector as V
 import qualified Data.HashMap.Strict as HM
 import qualified Data.Map as M
 
+import Debug.Trace
+
 zephyrCtxtWithStack :: ZephyrStack -> ZephyrContext
 zephyrCtxtWithStack stk = ZephyrContext
                         { zephyrContinuations = []
-                        , zephyrStack = stk
-                        , zephyrZippers = [] }
+                        , zephyrStack         = stk
+                        , zephyrZippers       = []
+                        , zephyrAsksStack     = [] }
 
 zephyrPush :: ZephyrD -> ZephyrContext -> ZephyrContext
-zephyrPush d (ZephyrContext conts stk zs) = ZephyrContext conts (d:stk) zs
+zephyrPush d (ZephyrContext conts stk zs askss) = ZephyrContext conts (d:stk) zs askss
 
 zephyrPushContinuation :: Vector CompiledZephyrAtom -> ZephyrContext -> ZephyrContext
-zephyrPushContinuation next (ZephyrContext conts stk zs) = ZephyrContext ((JustContinue next):conts) stk zs
+zephyrPushContinuation next (ZephyrContext conts stk zs askss) = ZephyrContext ((JustContinue next):conts) stk zs askss
 
-zephyrPushIf :: Vector CompiledZephyrAtom -> Vector CompiledZephyrAtom -> ZephyrContext -> ZephyrContext
-zephyrPushIf ifTrue ifFalse (ZephyrContext conts stk zs) =
-    ZephyrContext ((IfThenElseAndContinue ifTrue ifFalse):conts) stk zs
+zephyrPushIf :: Vector CompiledZephyrAtom -> Vector ZippyTyRef -> Vector CompiledZephyrAtom -> Vector ZippyTyRef  -> ZephyrContext -> ZephyrContext
+zephyrPushIf ifTrue trueAnswer ifFalse falseAnswer ctxt@(ZephyrContext conts stk zs askss) =
+    ZephyrContext ((IfThenElseAndContinue ifTrue trueAnswer ifFalse falseAnswer):conts) stk zs askss
 
 zephyrPushExitZipper :: Vector CompiledZephyrAtom -> ZephyrContext -> ZephyrContext
-zephyrPushExitZipper next (ZephyrContext conts stk zs) =
-    ZephyrContext ((ExitZipper next):conts) stk zs
+zephyrPushExitZipper next (ZephyrContext conts stk zs askss) =
+    ZephyrContext ((ExitZipper next):conts) stk zs askss
 
 zephyrPushDippedContinuation :: ZephyrD -> Vector CompiledZephyrAtom -> ZephyrContext -> ZephyrContext
-zephyrPushDippedContinuation d next (ZephyrContext conts stk zs) = ZephyrContext ((PushAndContinue d next):conts) stk zs
+zephyrPushDippedContinuation d next (ZephyrContext conts stk zs askss) = ZephyrContext ((PushAndContinue d next):conts) stk zs askss
+
+zephyrPushAnswer :: Vector ZippyTyRef -> ZephyrContext -> ZephyrContext
+zephyrPushAnswer answer ctxt = ctxt { zephyrAsksStack = answer:zephyrAsksStack ctxt,
+                                      zephyrContinuations = PopAnswer:zephyrContinuations ctxt }
+
+resolveTyRef :: ZephyrContext -> Either ZippyTyRef ZephyrAskRef -> ZippyTyRef
+resolveTyRef _ (Left ref) = ref
+resolveTyRef (ZephyrContext _ _ _ (answer:_)) (Right (ZephyrAskRef i)) = answer V.! i
 
 zephyrModifyStack :: (ZephyrStack -> ZephyrStack) -> ZephyrContext -> ZephyrContext
-zephyrModifyStack f (ZephyrContext conts stk zs) = ZephyrContext conts (f stk) zs
+zephyrModifyStack f (ZephyrContext conts stk zs askss) = ZephyrContext conts (f stk) zs askss
 
 zTrue, zFalse :: ZephyrD
 zFalse = ZephyrZ $ Zipper OnlyInMemory boolT (InMemoryD (CompositeD 0 V.empty)) []
@@ -71,63 +83,69 @@ runZephyr (ZephyrProgram entry symbols) sch initialStk =
                     [] -> return (Right initialCtxt)
                     ((JustContinue next):conts) -> go next (initialCtxt { zephyrContinuations = conts })
                     ((PushAndContinue dipped next):conts) -> go next (initialCtxt { zephyrContinuations = conts, zephyrStack = dipped:zephyrStack initialCtxt })
-                    ((IfThenElseAndContinue ifTrue ifFalse):conts) ->
+                    ((IfThenElseAndContinue ifTrue trueAnswer ifFalse falseAnswer):conts) ->
                         case zephyrStack initialCtxt of
                           (ZephyrZ cond):stk
-                              | isZFalse cond -> go ifFalse (initialCtxt { zephyrContinuations = conts, zephyrStack = stk })
-                              | isZTrue cond -> go ifTrue (initialCtxt { zephyrContinuations = conts, zephyrStack = stk })
-                          _ -> return (Left ConditionMustReturn0Or1)
+                              | isZFalse cond -> go ifFalse (initialCtxt { zephyrContinuations = PopAnswer:conts, zephyrStack = stk, zephyrAsksStack = falseAnswer:zephyrAsksStack initialCtxt })
+                              | isZTrue cond -> go ifTrue (initialCtxt { zephyrContinuations = PopAnswer:conts, zephyrStack = stk, zephyrAsksStack = trueAnswer:zephyrAsksStack initialCtxt })
+                          _ -> trace ("Got " ++ show (head (zephyrStack initialCtxt))) $ return (Left ConditionMustReturn0Or1)
                     ((ExitZipper next):conts) ->
                         go next (initialCtxt { zephyrContinuations = conts, zephyrStack = (ZephyrZ (head (zephyrZippers initialCtxt))):zephyrStack initialCtxt, zephyrZippers = tail (zephyrZippers initialCtxt) })
+                    (PopAnswer:conts) ->
+                        go mempty (initialCtxt { zephyrContinuations = conts, zephyrAsksStack = tail (zephyrAsksStack initialCtxt) })
               | curOp <- V.head bc, bc' <- V.tail bc = interpret curOp bc' initialCtxt
 
           interpret :: CompiledZephyrAtom -> Vector CompiledZephyrAtom -> ZephyrContext -> Tx (Either ZephyrEvalError ZephyrContext)
+          -- interpret op _ ctxt
+          --     | trace ("Evaluate op " ++ show op ++ " in " ++ show ctxt) False = undefined
           interpret (IntegerZ i) next ctxt = go next (zephyrPush (ZephyrD (IntegerD i)) ctxt)
           interpret (FloatingZ f) next ctxt = go next (zephyrPush (ZephyrD (FloatingD f)) ctxt)
           interpret (TextZ t) next ctxt = go next (zephyrPush (ZephyrD (TextD t)) ctxt)
           interpret (BinaryZ b) next ctxt = go next (zephyrPush (ZephyrD (BinaryD b)) ctxt)
-          interpret (QuoteZ (CompiledZephyr q)) next  ctxt = go next (zephyrPush (ZephyrQ q) ctxt)
-          interpret (SymZ sym) next ctxt = go (symbolBytecode (symbols V.! sym)) (zephyrPushContinuation next ctxt)
+          interpret (QuoteZ (CompiledZephyr q)) next  ctxt = go next (zephyrPush (ZephyrQ q mempty) ctxt)
+          interpret (SymZ answer sym) next ctxt =
+              let answer' = fmap (resolveTyRef ctxt) answer
+              in go (symbolBytecode (symbols V.! sym)) (zephyrPushAnswer answer' (zephyrPushContinuation next ctxt))
 
           interpret SwapZ next ctxt = go next (zephyrModifyStack (\(a:b:xs) -> (b:a:xs)) ctxt)
           interpret DupZ next ctxt = go next (zephyrModifyStack (\(a:xs) -> a:a:xs) ctxt)
           interpret ZapZ next ctxt = go next (zephyrModifyStack (\(_:xs) -> xs) ctxt)
           interpret CatZ next ctxt =
               case zephyrStack ctxt of
-                (ZephyrQ a):(ZephyrQ b):xs -> go next (ctxt { zephyrStack = (ZephyrQ (a V.++ b)):xs })
+                (ZephyrQ a _):(ZephyrQ b _):xs -> go next (ctxt { zephyrStack = (ZephyrQ (a V.++ b) mempty):xs })
                 _ -> return (Left CatZExpectsTwoQuotes)
           interpret ConsZ next ctxt =
               case zephyrStack ctxt of
-                (ZephyrQ qXs):qX:xs ->
+                (ZephyrQ qXs _):qX:xs ->
                     let qX' = case qX of
                                 ZephyrD (IntegerD i) -> IntegerZ i
                                 ZephyrD (FloatingD f) -> FloatingZ f
                                 ZephyrD (BinaryD b) -> BinaryZ b
                                 ZephyrD (TextD t) -> TextZ t
-                                ZephyrQ c -> QuoteZ (CompiledZephyr c)
-                    in go next (ctxt { zephyrStack = (ZephyrQ (qX' `V.cons` qXs)):xs })
+                                ZephyrQ c _ -> QuoteZ (CompiledZephyr c)
+                    in go next (ctxt { zephyrStack = (ZephyrQ (qX' `V.cons` qXs) mempty):xs })
                 _ -> return (Left ConsZExpectsAnAtomAndQuote)
           interpret UnConsZ next ctxt =
               case zephyrStack ctxt of
-                (ZephyrQ qXs):stk ->
+                (ZephyrQ qXs _):stk ->
                     let head = case V.head qXs of
-                                 QuoteZ (CompiledZephyr c) -> ZephyrQ c
+                                 QuoteZ (CompiledZephyr c) -> ZephyrQ c mempty
                                  IntegerZ i -> ZephyrD (IntegerD i)
                                  FloatingZ f -> ZephyrD (FloatingD f)
                                  BinaryZ b -> ZephyrD (BinaryD b)
                                  TextZ t -> ZephyrD (TextD t)
-                                 x -> ZephyrQ (V.singleton x)
-                    in go next (ctxt { zephyrStack = head:(ZephyrQ (V.tail qXs)):stk })
+                                 x -> ZephyrQ (V.singleton x) mempty
+                    in go next (ctxt { zephyrStack = head:(ZephyrQ (V.tail qXs) mempty):stk })
                 _ -> return (Left UnConsZExpectsQuote)
           interpret DeQuoteZ next ctxt =
               case zephyrStack ctxt of
-                (ZephyrQ next'):xs ->
-                    go next' (zephyrPushContinuation next (ctxt { zephyrStack = xs }))
-                _ -> return (Left DeQuoteZExpectsQuotedBlock)
+                (ZephyrQ next' answer):xs ->
+                    go next' (zephyrPushAnswer answer $ zephyrPushContinuation next (ctxt { zephyrStack = xs }))
+                _ -> trace ("Dequote got " ++ show (zephyrStack ctxt)) $ return (Left DeQuoteZExpectsQuotedBlock)
           interpret DipZ next ctxt =
               case zephyrStack ctxt of
-                (ZephyrQ next'):dipped:xs ->
-                    go next' (zephyrPushDippedContinuation dipped next (ctxt { zephyrStack = xs}))
+                (ZephyrQ next' answer):dipped:xs ->
+                    go next' (zephyrPushAnswer answer $ (zephyrPushDippedContinuation dipped next (ctxt { zephyrStack = xs})))
                 _ -> return (Left DipZExpectsQuoteAndSomethingElse)
           interpret ZipUpZ next ctxt =
               case zephyrZippers ctxt of
@@ -164,7 +182,7 @@ runZephyr (ZephyrProgram entry symbols) sch initialStk =
                 [] -> do curRes <- cur
                          case curRes of
                            CurIsAtom (InMemoryAtomD a) -> go next (zephyrPush (ZephyrD a) ctxt)
-                           CurHasTag _ -> return (Left CurIsNotAtom)
+                           CurHasTag tag -> return (Left CurIsNotAtom)
                 (Zipper _ _ (InMemoryD dt) _):_ ->
                     case dt of
                       CompositeD _ _ -> return (Left CurIsNotAtom)
@@ -180,8 +198,8 @@ runZephyr (ZephyrProgram entry symbols) sch initialStk =
                     go next (zephyrPush (ZephyrD (IntegerD (fromIntegral hole))) ctxt)
           interpret EnterZipperZ next ctxt =
               case zephyrStack ctxt of
-                (ZephyrQ next'):(ZephyrZ z):stk ->
-                    go next' (zephyrPushExitZipper next (ctxt { zephyrStack = stk, zephyrZippers = z:zephyrZippers ctxt }))
+                (ZephyrQ next' answer):(ZephyrZ z):stk ->
+                    go next' (zephyrPushAnswer answer $ zephyrPushExitZipper next (ctxt { zephyrStack = stk, zephyrZippers = z:zephyrZippers ctxt }))
                 _ -> return (Left EnterZipperExpects1Zipper)
           interpret CutZ next ctxt =
               do z <- cut
@@ -195,12 +213,15 @@ runZephyr (ZephyrProgram entry symbols) sch initialStk =
           --           in go next (ctxt { zephyrStack = res:stk })
           interpret IfThenElseZ next ctxt =
               case zephyrStack ctxt of
-                (ZephyrQ else_):(ZephyrQ then_):(ZephyrQ if_):stk ->
-                    go if_ (zephyrPushIf then_ else_ (ctxt { zephyrStack = stk }))
+                (ZephyrQ else_ elseAnswer):(ZephyrQ then_ thenAnswer):(ZephyrQ if_ answer):stk ->
+                   go if_ (zephyrPushAnswer answer (zephyrPushIf then_ thenAnswer else_ elseAnswer (ctxt { zephyrStack = stk })))
           interpret LengthZ next ctxt =
               case zephyrStack ctxt of
-                (ZephyrQ b):stk ->
+                (ZephyrQ b _):stk ->
                     go next (ctxt { zephyrStack = ZephyrD (IntegerD (fromIntegral (V.length b))):stk })
+          interpret RandomZ next ctxt =
+              do r <- randomIntTx
+                 go next (ctxt { zephyrStack = ZephyrD (IntegerD r):zephyrStack ctxt })
           interpret FailZ next ctxt =
               case zephyrStack ctxt of
                 x:_ -> return (Left (HitFail (show x)))
@@ -214,6 +235,9 @@ runZephyr (ZephyrProgram entry symbols) sch initialStk =
               case zephyrStack ctxt of
                 x:stk -> logAction (TxLogMessage (show x)) >>
                          go next (ctxt { zephyrStack = stk })
+          interpret TraceZ next ctxt =
+              do logAction (TxLogMessage ("Tracing: " <> show ctxt))
+                 go next ctxt
           interpret EqZ next ctxt =
               arithmetic (\a b -> if a == b then zTrue else zFalse) next ctxt
           interpret LtZ next ctxt =
@@ -224,20 +248,39 @@ runZephyr (ZephyrProgram entry symbols) sch initialStk =
               arithmetic (\a b -> ZephyrD (IntegerD (a + b))) next ctxt
 
           -- Internal only... TagZ can be used to construct literal zippers
-          interpret (TagZ (ZippyTyRef tyRef) tag argCnt) next ctxt =
+          interpret (TagZ zephyrTyRef tag argCnt) next ctxt =
               let stk = zephyrStack ctxt
                   args = reverse (take argCnt stk)
+
+                  ZippyTyRef tyRef = case zephyrTyRef of
+                                       Right (ZephyrAskRef ask) ->
+                                           let asks = head (zephyrAsksStack ctxt)
+                                           in asks V.! ask
+                                       Left tyRef -> tyRef
+
+                  ctxt' = ctxt { zephyrStack = drop argCnt (zephyrStack ctxt) }
               in case spineStrictMapM (liftM eraseInMemoryD . zephyrDToInMemoryD) args of
                    Right zippyArgs ->
-                       go next (zephyrPush (ZephyrZ (Zipper OnlyInMemory (zippyTypes sch V.! tyRef) (InMemoryD (CompositeD tag (V.fromList zippyArgs))) [])) ctxt)
+                       go next (zephyrPush (ZephyrZ (Zipper OnlyInMemory (zippyTypes sch V.! tyRef) (InMemoryD (CompositeD tag (V.fromList zippyArgs))) [])) ctxt')
                    Left err -> return (Left err)
+
+          interpret (AnswerZ answer) next ctxt =
+              case zephyrStack ctxt of
+                ZephyrQ next' _:xs ->
+                    go next (ctxt { zephyrStack = ZephyrQ next' (fmap (resolveTyRef ctxt) answer):xs })
+                x -> go next ctxt
+          interpret DupAnswerZ next ctxt =
+              let curAsks = case zephyrAsksStack ctxt of
+                              (ask:_) -> ask
+                              _ -> mempty
+              in interpret (AnswerZ (fmap Left curAsks)) next ctxt
 
           arithmetic :: (Int64 -> Int64 -> ZephyrD) -> Vector CompiledZephyrAtom -> ZephyrContext -> Tx (Either ZephyrEvalError ZephyrContext)
           arithmetic f next ctxt =
               case zephyrStack ctxt of
                 (ZephyrD (IntegerD b)):(ZephyrD (IntegerD a)):stk ->
                     go next (ctxt { zephyrStack = (f a b):stk })
-                _ -> return (Left ExpectingTwoIntegersForArithmetic)
+                _ -> return (Left (ExpectingTwoIntegersForArithmetic (zephyrStack ctxt)))
 
 
           zephyrDToInMemoryD d =
