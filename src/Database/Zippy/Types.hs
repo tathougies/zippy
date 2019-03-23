@@ -38,36 +38,37 @@ module Database.Zippy.Types
     , spineStrictMapM
     ) where
 
-import Control.Monad.Free.Church
-import Control.Concurrent.MVar
-import Control.Concurrent.Chan
-import Control.Concurrent.MVar
-import Control.DeepSeq
-import Control.Applicative
+import           Control.Monad.Free.Church
+import           Control.Concurrent.MVar
+import           Control.Concurrent.Chan
+import           Control.Concurrent.MVar
+import           Control.DeepSeq
+import           Control.Applicative
 
-import Data.ByteString (ByteString)
-import Data.Coerce
-import Data.HashMap.Strict (HashMap)
-import Data.Hashable (Hashable(..), hashWithSalt)
-import Data.IORef
-import Data.Int
-import Data.Monoid
-import Data.Sequence (Seq)
-import Data.String
-import Data.Text (Text)
-import Data.Vector (Vector)
-import Data.Word
-import Data.Time.Clock.POSIX
-import Data.HashPSQ (HashPSQ)
-import Data.Traversable (Traversable)
-import Data.Foldable (Foldable)
+import           Data.ByteString (ByteString)
+import           Data.Coerce
+import           Data.Foldable (Foldable)
+import           Data.HashMap.Strict (HashMap)
+import           Data.HashPSQ (HashPSQ)
+import           Data.Hashable (Hashable(..), hashWithSalt)
+import           Data.IORef
+import           Data.Int
+import           Data.Monoid
+import           Data.Semigroup
+import           Data.Sequence (Seq)
+import           Data.String
+import           Data.Text (Text)
+import           Data.Time.Clock.POSIX
+import           Data.Traversable (Traversable)
+import           Data.Vector (Vector)
+import           Data.Word
 
 import qualified Data.HashPSQ as PSQ
 import qualified Data.ByteString as BS
 import qualified Data.Text as T
 import qualified Data.Vector as V
 
-import System.IO
+import           System.IO
 
 -- * User Defined Kinds
 
@@ -277,7 +278,7 @@ data Movement = Replace !InMemoryD
 -- | Transaction logs log all the directions we've moved through the data structure,
 --   and what we found there.
 newtype TransactionLog = TransactionLog (Seq TransactionEntry)
-    deriving (Show, Monoid)
+    deriving (Show, Monoid, Semigroup)
 
 data TransactionEntry where
     TxnDown :: !Int -> TransactionEntry

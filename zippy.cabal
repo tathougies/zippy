@@ -24,9 +24,10 @@ library
                        Database.Zippy.Zephyr.Compile Database.Zippy.Zephyr.TyCheck Database.Zippy.Zephyr.Internal
                        Database.Zippy.Zephyr.JIT
   default-extensions:  DataKinds, KindSignatures, GADTs, StandaloneDeriving, RoleAnnotations, DeriveFunctor, GeneralizedNewtypeDeriving, BangPatterns
-  build-depends:       base >=4.7 && <4.9, text >=1.1 && <1.3, bytestring >=0.10 && <0.11, vector >=0.10 && <0.11, containers >=0.5, unordered-containers >= 0.2 && < 0.3,
-                       free >= 4.12, hashable >= 1.2 && < 1.3, indents >= 0.3, parsec == 3.*, network-conduit >= 1.1, conduit >= 1.1, conduit-extra, hslogger, mtl >=2.2,
-                       network, network-simple, random, attoparsec, free, time, psqueues, deepseq, dlist, directory >= 1.2, filepath >=1.3, union-find, hashtables
+  build-depends:       base >=4.7 && <4.13, text >=1.1 && <1.3, bytestring >=0.10 && <0.11, vector >=0.10 && <0.13, containers >=0.5, unordered-containers >= 0.2 && < 0.3,
+                       free >= 4.12, hashable >= 1.2 && < 1.3, indents >= 0.3, parsec == 3.*, hslogger, mtl >=2.2, streaming, streaming-attoparsec,
+                       network, network-simple, random, attoparsec, free, time, psqueues, deepseq, dlist, directory >= 1.2, filepath >=1.3, union-find, hashtables,
+                       streaming-bytestring
   hs-source-dirs:      src
   default-language:    Haskell2010
   ghc-options:         -O2 -threaded -rtsopts
@@ -34,12 +35,13 @@ library
 
 executable zippy-serve
   main-is:             main.hs
-  build-depends:       base >= 4.7 && <4.9, optparse-applicative, zippy ==0.1.0.0, hslogger, unix
+  build-depends:       base >= 4.7 && <4.13, optparse-applicative, zippy, hslogger, unix
   default-language:    Haskell2010
   ghc-options:         -O2 -threaded -rtsopts
                        -- -fprof-auto -fprof-cafs
 
 executable zippy-new-db
   main-is:             new-db.hs
-  build-depends:       base >= 4.7 && < 4.9, zippy ==0.1.0.0
+  build-depends:       base >= 4.7 && < 4.13, zippy
   default-language:    Haskell2010
+

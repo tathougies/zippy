@@ -2,41 +2,46 @@
 module Database.Zippy.Persist
     ( readZippyDFromDisk, writeZippyDToDisk, updateRoot, readTime, writeTime ) where
 
-import Database.Zippy.Types
+import           Database.Zippy.Types
 
-import Prelude hiding (mapM, foldl)
+import           Prelude hiding (mapM, foldl)
 
-import Control.Applicative
-import Control.Monad hiding (mapM)
-import Control.Arrow (second)
-import Control.DeepSeq
+import           Control.Applicative
+import           Control.Monad hiding (mapM)
+import           Control.Arrow (second)
+import           Control.DeepSeq
 
-import Data.Bits
-import Data.Word
-import Data.Int
-import Data.Monoid
-import Data.Traversable (mapM)
-import Data.Foldable (foldl)
-import Data.Text (Text)
-import Data.ByteString (ByteString)
-import Data.ByteString.Builder (Builder, int64LE, doubleLE, word64LE, word16LE, int32LE)
+import           Data.Bits
+import           Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
+import           Data.ByteString.Builder (Builder, int64LE, doubleLE, word64LE, word16LE, int32LE)
 import qualified Data.ByteString.Builder as BS
+import           Data.Foldable (foldl)
+import           Data.IORef
+import           Data.Int
+import           Data.Monoid
+import           Data.Semigroup
+import           Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
+import           Data.Traversable (mapM)
 import qualified Data.Vector as V
+import           Data.Word
 
-import Foreign.Marshal.Alloc
-import Foreign.Ptr
-import Foreign.Storable
+import           Foreign.Marshal.Alloc
+import           Foreign.Ptr
+import           Foreign.Storable
 
-import System.IO
+import           System.IO
 
-import Data.IORef
-import System.CPUTime
-import System.IO.Unsafe
+import           Data.IORef
+import           System.CPUTime
+import           System.IO.Unsafe
 
 data FixedLengthBuilder = FixedLengthBuilder !Word64 !Builder
+
+instance Semigroup FixedLengthBuilder where
+    (<>) = mappend
 
 instance Monoid FixedLengthBuilder where
     mempty = FixedLengthBuilder 0 mempty
