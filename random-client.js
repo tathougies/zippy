@@ -64,12 +64,12 @@ var q = async.queue(function ( data, allDone ) {
 	    };
 	    client.on('data', dataListener);
 
-	    client.write("down 0\n");
+//	    client.write("down 0\n");
 	    console.log("[" + i + "] insert", newRandom);
 //	    console.time('insert');
-	    client.write("insert " + newRandom + " \"This is key " + newRandom + "\" \n");
+//	    client.write("insert " + newRandom + " \"This is key " + newRandom + "\"\n");
 	    //	    client.write("query insert-key " + newRandom + " \"This is key " + newRandom + "\" \n");
-	    //client.write("txquery insert-key " + newRandom + " \"This is key " + newRandom + "\" \n");
+	    client.write("txquery insert-key " + newRandom + " \"This is key " + newRandom + "\" \n");
 //	    client.write("commit\n");
 	});
     }

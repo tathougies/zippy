@@ -378,8 +378,10 @@ stackTyP = do stackTy <- (ZephyrStackBottomT <$ char '0') <|>
                          (ZephyrVarT <$> (char '*' *> zephyrTyVarNameP)) <?> "stack base"
               whitespace
               tryContinueP stackTy
-    where tryContinueP parent = try (tryContinueP =<< (stackAtomTyP (\stackAtom -> pure (parent :> stackAtom)) <* whitespace)) <|>
-                                return parent
+    where
+      tryContinueP :: ZephyrStackT ZippyTyVarName -> Parser (ZephyrStackT ZippyTyVarName)
+      tryContinueP parent = try (tryContinueP =<< (stackAtomTyP (\stackAtom -> pure (parent :> stackAtom)) <* whitespace)) <|>
+                            return parent
 
 stackAtomTyP :: (forall k. (IsStackAtomKind k ~ True, IsKind k) => ZephyrT k ZippyTyVarName -> Parser a) -> Parser a
 stackAtomTyP cont = try (cont =<< (zipperKindedZephyrZipper . SimpleFieldT <$> zephyrSimpleTyP <* whitespace)) <|>

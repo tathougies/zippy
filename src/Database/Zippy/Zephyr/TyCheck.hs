@@ -1,35 +1,36 @@
 {-# LANGUAGE RecordWildCards, TupleSections, RankNTypes, OverloadedStrings, MultiParamTypeClasses, LambdaCase, ScopedTypeVariables #-}
 module Database.Zippy.Zephyr.TyCheck where
 
-import Database.Zippy.Zephyr.Types
-import Database.Zippy.Zephyr.Parse
-import Database.Zippy.Zephyr.Internal
-import Database.Zippy.Types
+import           Database.Zippy.Zephyr.Types
+import           Database.Zippy.Zephyr.Parse
+import           Database.Zippy.Zephyr.Internal
+import           Database.Zippy.Types
 
-import Prelude hiding (mapM)
+import           Prelude hiding (mapM)
 
-import Control.Applicative
-import Control.Arrow
-import Control.Monad.ST
-import Control.Monad.State hiding (mapM)
+import           Control.Applicative
+import           Control.Arrow
+import           Control.Monad.ST
+import           Control.Monad.State hiding (mapM)
 
-import Data.Proxy
-import Data.STRef
-import Data.Traversable (mapM)
-import Data.Foldable (Foldable, foldlM, foldrM)
-import Data.List (intercalate)
-import Data.Monoid
-import Data.Maybe
-import Data.UnionFind.ST
+import qualified Data.DList as D
+import           Data.Foldable (Foldable, foldlM, foldrM)
+import qualified Data.HashMap.Strict as HM
+import qualified Data.HashTable.Class as HTC
+import qualified Data.HashTable.ST.Basic as HT
+import           Data.List (intercalate)
+import           Data.Maybe
+import           Data.Monoid
+import           Data.Proxy
+import           Data.STRef
+import           Data.Semigroup
 import qualified Data.Set as S
 import qualified Data.Text as T
+import           Data.Traversable (mapM)
+import           Data.UnionFind.ST
 import qualified Data.Vector as V
-import qualified Data.DList as D
-import qualified Data.HashMap.Strict as HM
-import qualified Data.HashTable.ST.Basic as HT
-import qualified Data.HashTable.Class as HTC
 
-import Debug.Trace
+import           Debug.Trace
 
 data ZephyrTyCheckState s = ZephyrTyCheckState
                           { nextVar :: ST s ZephyrTyVar
@@ -47,6 +48,9 @@ newtype ZephyrTyErrorLocation = ZephyrTyErrorLocation (ZephyrTyCheckLocation -> 
 instance Monoid ZephyrTyErrorLocation where
     mempty = ZephyrTyErrorLocation id
     mappend (ZephyrTyErrorLocation a) (ZephyrTyErrorLocation b) = ZephyrTyErrorLocation $ a . b
+
+instance Semigroup ZephyrTyErrorLocation where
+    (<>) = mappend
 
 instance Show ZephyrTyErrorLocation where
     show (ZephyrTyErrorLocation loc) = show (loc Here)

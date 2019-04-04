@@ -1,0 +1,148 @@
+PACKAGE test
+
+DEFINE find-key-in-db ==
+  0 ZIP-DOWN { get to the actual treap in the database }
+  [ SWAP int-compare ] CONS
+  0 SWAP
+  treap-find
+
+EXPORT find-key-in-db
+
+DEFINE insert-key-in-db ==
+  0 ZIP-DOWN { get to the actual treap in the database }
+  [ SWAP [ DUP [ SWAP int-compare ] CONS SWAP ] DIP SWAP ] DIP
+  treap-insert
+  ZIP-UP
+
+EXPORT insert-key-in-db
+
+DEFINE find-leftmost-in-treap-rec ==
+  CUR-TAG
+  [ 1 == ]
+  [ 3 ZIP-DOWN { If we're a branch, go left }
+    1 + { increase the level }
+    find-leftmost-in-treap-rec
+  ]
+  [ ZIP-UP { if we're a leaf, go back to the parent }
+    -1 + { decrease the level... We're done since we hit a leaf } ]
+  IFTE
+
+DEFINE find-leftmost-in-treap ==
+  0 find-leftmost-in-treap-rec
+
+EXPORT find-leftmost-in-treap
+
+DEFINE get-value ==
+  1 ZIP-DOWN
+  CUR-ATOM
+  ZIP-UP
+
+EXPORT get-value
+
+DEFINE next-parent ==
+    [ DUP 0 == ] { check the level }
+    [ ]
+    [
+      [ ARG-HOLE 3 == ]
+      [ { we are the left child of the parent, so end at the parent } -1 + ZIP-UP ]
+      [ -1 + ZIP-UP next-parent ]
+      IFTE
+    ]
+    IFTE
+
+DEFINE next-in-treap ==
+  { first check if we have any in the right child }
+  4 ZIP-DOWN
+  CUR-TAG
+  [ 0 == ]
+  [ { This is a leaf, so go back and then up to the parent }
+    ZIP-UP
+    next-parent
+  ]
+  [ 1 +
+    find-leftmost-in-treap-rec { increase the level appropriately } ]
+  IFTE
+
+EXPORT next-in-treap
+
+DEFINE get-n-rec ==
+  [ DUP 0 == ]
+  [ ]
+  [
+    [ CUT YIELD ] VISIT-value
+
+    -1 + { Decrease n }
+
+    { next-in-treap expects the level as its first argument. DIP below to the level }
+    [ next-in-treap ] DIP
+
+    get-n-rec
+  ]
+  IFTE
+
+DEFINE get-n ==
+  get-n-rec
+
+EXPORT get-n
+
+DEFINE yield-this ==
+  CUT YIELD
+
+EXPORT yield-this
+
+DEFINE db-height ==
+  CUT { this is a read-only transaction, so we can cut the zipper here, and operate on a read-only replica }
+  [ 0 ZIP-DOWN
+    treap-height
+    ZIP-UP ] ENTER-ZIPPER
+  ZAP
+
+EXPORT db-height
+
+DATA ProductsDatabase ==
+  CONS ProductsDatabase products=(Treap Text Product)
+
+DATA Product ==
+  CONS Product sku=Text type=ProductType title=Text description=Text pricing=PricingDetails
+
+DATA ProductType ==
+  CONS AudioCD
+  CONS DVD
+  CONS VideoGame
+
+DATA ProductCategory ==
+  CONS Jazz
+  CONS Action
+  CONS RockNRoll
+  CONS Adventure
+  CONS Comedy
+  CONS Music
+
+DATA PricingDetails ==
+  CONS PricingDetails list=Floating savings=Floating
+
+DEFINE insert-product ==
+  [ "dipped below prio" LOG
+    [
+      [ CUR-ATOM ] VISIT-sku
+      DUP
+      [ SWAP int-compare ] CONS
+      SWAP { now stack is key, keycmp }
+    ] ENTER-ZIPPER
+    { now stack is val, key, keycmp }
+    SWAP
+  ] DIP
+  treap-insert
+
+DEFINE insert-products ==
+  [ "01234567" AudioCD "John Coltrane" "Some cool music" 5.89 0.10 PricingDetails
+    Product
+    10 { prio ... TODO Generate RANDOM }
+    insert-product
+
+    { "99999999" DUP DVD "Jurassic Park" "Cool movie about dinosaurs" 30.00 1 PricingDetails SWAP
+    14
+    insert-product}
+    ] VISIT-products
+
+EXPORT insert-products

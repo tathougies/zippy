@@ -96,8 +96,8 @@ runZephyr (ZephyrProgram entry symbols) sch initialStk =
               | curOp <- V.head bc, bc' <- V.tail bc = interpret curOp bc' initialCtxt
 
           interpret :: CompiledZephyrAtom -> Vector CompiledZephyrAtom -> ZephyrContext -> Tx (Either ZephyrEvalError ZephyrContext)
-          -- interpret op _ ctxt
-          --     | trace ("Evaluate op " ++ show op ++ " in " ++ show ctxt) False = undefined
+--           interpret op _ ctxt
+--               | trace ("Evaluate op " ++ show op ++ " in " ++ show ctxt) False = undefined
           interpret (IntegerZ i) next ctxt = go next (zephyrPush (ZephyrD (IntegerD i)) ctxt)
           interpret (FloatingZ f) next ctxt = go next (zephyrPush (ZephyrD (FloatingD f)) ctxt)
           interpret (TextZ t) next ctxt = go next (zephyrPush (ZephyrD (TextD t)) ctxt)

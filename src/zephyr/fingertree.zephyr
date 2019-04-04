@@ -1,0 +1,65 @@
+PACKAGE fingertree
+
+DATA FingerTree m v ==
+  CONS Empty
+  CONS Single singleton=v
+  CONS Deep partial=m left=(Digit v) rest=(FingerTree m (Node m v)) right=(Digit v)
+
+DATA Digit v ==
+  CONS One one=v
+  CONS Two oneOfTwo=v twoOfTwo=v
+  CONS Three oneOfThree=v twoOfThree=v threeOfThree=v fourOfThree=v
+  CONS Four oneOfFour=v twoOfFour=v threeOfFour=v fourOfFour=v
+
+DATA Node m v ==
+  CONS NodeTwo partialOfTwo=m leftOfTwo=v rightOfTwo=v
+  CONS NodeThree partialOfThree=m oneOfThree=v twoOfThree=v threeOfThree=v
+
+DATA SplitResult m v ==
+  CONS SplitResult toTheLeft=(FingerTree m v) toTheRight=(FingerTree m v)
+
+DEFINE nodeToDigit ==
+  [ CUR-IS-NodeTwo? ]
+  [ [ CUT ] VISIT-NodeTwo-leftOfTwo
+    [ CUT ] VISIT-NodeTwo-rightOfTwo
+    Two ] ]
+  [ [ CUR-IS-NodeThree?
+    [ [ CUT ] VISIT-NodeThree-oneOfThree
+      [ CUT ] VISIT-NodeThree-twoOfThree
+      [ CUT ] VISIT-NodeThree-threeOfThree
+      Three ] ]
+    [ "nodeToDigit: unhandled tag" FAIL ]
+    IFTE ]
+  IFTE
+
+DEFINE split ==
+  { mempty mappend measure predicate }
+  [ CUR-IS-Empty? ]
+  [ ZAP ZAP ZAP ZAP Empty Empty ]
+  [ [ [ DUP I ] DIP DUP [ I ] DIP SWAP ] { calculate predicate (measure this) }
+    [
+    { Copy mempty mappend measure predicate }
+
+    [ [ [ DUP ] DIP SWAP ] DIP SWAP ] DIP SWAP
+    [ [ [ DUP ] DIP SWAP ] DIP SWAP ] DIP SWAP
+    [ [ [ DUP ] DIP SWAP ] DIP SWAP ] DIP SWAP
+    [ [ [ DUP ] DIP SWAP ] DIP SWAP ] DIP SWAP
+    splitTree
+
+    appendLeft
+
+    ]
+    [ CUT Empty ]
+    IFTE ]
+  IFTE
+
+DEFINE appendLeft ==
+  [ CUR-IS-Empty? ]
+  [ ZAP Single ]
+  [ [ CUR-IS-Single? ]
+    [ [ CUT ] VISIT-Single-singleton
+      One SWAP One
+    ]
+    [ ]
+    IFTE ]
+  IFTE

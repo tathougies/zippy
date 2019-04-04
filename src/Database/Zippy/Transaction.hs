@@ -362,7 +362,7 @@ interpretTxSync sch txnsChan txnId tx =
                 , txnsChan = txnsChan
                 , txnId = txnId }
 
-       interpretTxSync' st (fromF tx)
+       interpretTxSync' st (fromF (runTx tx))
 
 data TxAsyncInterpretSettings =
     TxAsyncInterpretSettings
@@ -485,7 +485,7 @@ interpretTxAsync sch shouldResync txnsChan logFunc txnId tx =
                 { asyncDiskCache = diskCache
                 , asyncCurZipper = z
                 , asyncInterpreterLog = txLog }
-       (TxAsyncInterpretState _ z' txLog', ret) <- interpretTxAsync' settings st (fromF tx)
+       (TxAsyncInterpretState _ z' txLog', ret) <- interpretTxAsync' settings st (fromF (runTx tx))
 
        case shouldResync of
          ResyncAfterTx -> do waitV <- newEmptyMVar

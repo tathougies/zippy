@@ -32,59 +32,6 @@ DEFINE int-compare ==
   ]
   IFTE
 
-{
-DEFINE switch ==
-  [ DUP null? ]
-  [ "No cases matched" FAIL ]
-  [
-    { Now we have our quoted program of quoted programs of the form
-      [
-        [ cond1 expr1 ]
-        [ cond2 expr2 ]
-      ]
-    }
-    UNCONS
-    { Now we've popped the first cond/expr pair off the stack }
-    UNCONS
-    [ UNCONS SWAP ZAP ] DIP
-    { Now the stack has cond at the top and the expression to run if cond succeeds
-      then comes the list of remaining conditions and the recursive function }
-    { Now we have a stack that looks like:
-      then-part cond }
-    [ { the condition needs to run without the then-block and remaining on top of stack }
-      { stack looks like cond, then-block, remaining }
-      SWAP
-      {then-block, cond, remaining }
-      [ SWAP { remaining, cond }
-        [ {cond } I { res } ] DIP {remaining, res}
-	SWAP {res, remaining} ] DIP {then-block, res, remaining}
-      SWAP {res, then-block, remaining} ]
-    [ SWAP ZAP I ]
-    [ ZAP switch ]
-    IFTE
-  ]
-  IFTE}
-{
-DEFINE null? ==
-  LENGTH 0 ==
-
-DEFINE repeat-n ==
-  { we are called with action, n }
-  { first check if n == 0 }
-  [ [ DUP 0 == ] DIP SWAP ]
-  [ { if so, get rid of action and n } ZAP ZAP ]
-  [ { Otherwise, run action but make sure to dip below n }
-    SWAP
-    { now have n, action }
-    [ DUP I ] DIP
-    { now have n, action }
-    -1 +
-    { now have n - 1, action }
-    SWAP
-    repeat-n
-  ]
-  IFTE}
-
 DEFINE max ==
   [ [ DUP ] DIP SWAP
     [ DUP ] DIP SWAP

@@ -211,9 +211,9 @@ inferAsks typeLookupEnv typeInstantiationEnv initialSt =
                       asksList = S.toList asks'
                       askToAskIndex = M.fromList (zip asksList [0..])
 
-                      compileOps :: [ZephyrOpComment] -> ZephyrBeforeAskInference -> State ZephyrTypeInstantiationEnv CompiledZephyr
-                      compileOps comments (ZephyrBeforeAskInference ops) = trace ("Compile " ++ show ops ++ " with comments " ++ show comments)
-                                                                           (CompiledZephyr . V.fromList . mconcat <$> mapM (uncurry compileOp) (zip comments ops))
+                      compileOps :: ZephyrWord -> [ZephyrOpComment] -> ZephyrBeforeAskInference -> State ZephyrTypeInstantiationEnv CompiledZephyr
+                      compileOps nm comments (ZephyrBeforeAskInference ops) = trace ("Compile " ++ show nm ++ " (" ++ show ops ++ ") with comments " ++ show comments)
+                                                                              (CompiledZephyr . V.fromList . mconcat <$> mapM (uncurry compileOp) (zip comments ops))
 
                       compileOp (ZephyrSymbolType monoTy) (SymZ _ x) =
                           do let Just (referredTy, _, _, _, _) = HM.lookup x allReferredSymsMap
@@ -243,11 +243,11 @@ inferAsks typeLookupEnv typeInstantiationEnv initialSt =
                                                   pure [ SymZ (V.fromList resolvedAsks) x ]
                                Left err -> error ("Error resolving types: " ++ show err)
 
-                      compileOp (ZephyrQuoteComments comments) (QuoteZ ops) = do op <- QuoteZ <$> compileOps comments ops
+                      compileOp (ZephyrQuoteComments comments) (QuoteZ ops) = do op <- QuoteZ <$> compileOps "" comments ops
                                                                                  pure [op, DupAnswerZ]
                       compileOp comment (QuoteZ q) = error ("Got quote but no comment? " ++ show comment ++ ". Symbols are " ++ show q)
                       compileOp _ op = pure [mapAsk (error "unsupported ask") . mapQuote (error "unsupported quote") $ op]
-                  in (pkg, symName, symTy, asksList, symOpTypes,) <$> compileOps symComments symOps
+                  in (pkg, symName, symTy, asksList, symOpTypes,) <$> compileOps symName symComments symOps
 
     in trace ("Inferring in " ++ intercalate "\n" (zipWith (\i sym -> show i ++ ": " ++ show sym) [0..] initialSt)) $
        trace ("Ask groups: " ++ show askInferenceGroups) $
@@ -272,9 +272,9 @@ compilePackages pkgs rootTy =
                pure (pkg, (genTy, asks', def))
 
         tyInstantiationEnv = foldl (\env pkg -> instantiateAllTypes allTypes env (zephyrTypes pkg)) emptyZephyrTypeInstantiationEnv pkgs
-        tyChecked = trace ("Got definitions " ++ show uninstantiatedDefs) $
-                    runInNewTyCheckM $ do
+        tyChecked = runInNewTyCheckM $ do
                       definitions <- mapM instantiateDef uninstantiatedDefs
+                      traceM ("Got definitions " ++ show definitions)
                       let pretypedSymbols = buildSymbolEnv $
                                             map (\(pkgName, (ty, _, ZephyrSymbolDefinition symName _)) -> ((ZephyrWord pkgName, symName), ty)) definitions
                       tyCheckedPkgs <- tyCheckPackages pretypedSymbols allTypes pkgs
@@ -310,16 +310,19 @@ compilePackages pkgs rootTy =
 
                 (inferredAsks, tyInstantiationEnv') = inferAsks allTypes tyInstantiationEnv initialAsks
                 initialAsks = map (\(pkg, symName, (ty, comments, opTypes, def)) -> (pkg, symName, ty, UserDefined opTypes, [], comments, def)) resolvedSymbols ++
-                              map (\(pkg, (ty, asks, ZephyrSymbolDefinition symName _)) -> (ZephyrWord pkg, symName, ty, Builtin, asks, [], ZephyrBeforeAskInference [])) definitions
+                              map (\(pkg, (ty, asks, ZephyrSymbolDefinition symName def)) ->
+                                        (ZephyrWord pkg, symName, ty, Builtin, asks, [], ZephyrBeforeAskInference [])) definitions
 
-                symTbl' = V.fromList (map (\(pkg, symName, symTy, _, opTypes, compiled) -> (symTy, opTypes, CompiledZephyrSymbol (ZephyrQualifiedWord pkg symName) compiled)) inferredAsks ++
+                symTbl' = V.fromList ((map snd $ zip resolvedSymbols $
+                                      map (\(pkg, symName, symTy, _, opTypes, compiled) -> (symTy, opTypes, CompiledZephyrSymbol (ZephyrQualifiedWord pkg symName) compiled)) inferredAsks) ++
                                       map (\(pkg, (ty, _, ZephyrSymbolDefinition symName def)) -> (ty, Builtin, CompiledZephyrSymbol (ZephyrQualifiedWord (ZephyrWord pkg) symName) def)) definitions)
                 resolveDef (ZephyrTyChecked atoms) =
                     ZephyrBeforeAskInference $ map (mapQuote resolveDef . fmap resolveSymbol) atoms
                 resolveSymbol sym = case lookupInSymbolEnv (Left sym) symEnv of
                                       Nothing -> error ("Could not find symbol " ++ show sym)
                                       Just i -> i
-            in (schema, symEnv, symTbl')
+            in trace ("Got symbol names " ++ show allSymbolNames) $
+               (schema, symEnv, symTbl')
 
     in case tyChecked of
          Left err -> Left (ZephyrCompileErrorTy err)

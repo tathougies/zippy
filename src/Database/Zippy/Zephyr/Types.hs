@@ -16,6 +16,7 @@ import Data.String
 import Data.Hashable
 import Data.Word
 import Data.Monoid
+import Data.Semigroup
 import Data.Proxy
 import Data.Traversable (Traversable(traverse), mapM)
 import Data.Foldable (Foldable(foldMap))
@@ -118,7 +119,7 @@ data ZephyrBuilderOp = ZephyrStateAssertion !(ZephyrExecState ZippyTyVarName) !S
                      | ZephyrAtom !ZephyrBuilderAtom !SourceRange
                        deriving Show
 newtype ZephyrBuilder = ZephyrBuilder (DList ZephyrBuilderOp)
-    deriving (Show, Monoid)
+    deriving (Show, Monoid, Semigroup)
 
 type ZephyrTyCheckedAtom = GenericZephyrAtom (ZephyrT ZephyrStackAtomK ZephyrTyVar) ZephyrTyChecked ZephyrWord
 newtype ZephyrTyChecked = ZephyrTyChecked [ZephyrTyCheckedAtom]

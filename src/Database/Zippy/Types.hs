@@ -9,7 +9,7 @@ module Database.Zippy.Types
     , eraseInMemoryD
 
     , ZippyTyName(..), ZippyDataConName(..), ZippyTyRef(..)
-    , GenericZippyTyCon(..), ZippyTyCon(..), GenericZippyTyCon(..)
+    , GenericZippyTyCon(..), ZippyTyCon(..)
     , GenericZippyField(..), ZippyField(..), zippyFieldType
     , ZippyDataArgName(..), ZippyTyVarName(..)
     , GenericZippyDataCon(..), ZippyDataCon(..), ZippyFieldType(..)
@@ -38,12 +38,12 @@ module Database.Zippy.Types
     , spineStrictMapM
     ) where
 
-import           Control.Monad.Free.Church
-import           Control.Concurrent.MVar
+import           Control.Applicative
 import           Control.Concurrent.Chan
 import           Control.Concurrent.MVar
 import           Control.DeepSeq
-import           Control.Applicative
+import           Control.Monad.Fail
+import           Control.Monad.Free.Church
 
 import           Data.ByteString (ByteString)
 import           Data.Coerce
@@ -325,37 +325,42 @@ data TxF next = MoveTx !Movement (MoveResult -> next)
 
               | RandomTx (Int64 -> next)
                 deriving Functor
-type Tx = F TxF
+newtype Tx a = Tx { runTx :: F TxF a }
+    deriving ( Monad, Applicative, Functor )
+
+instance MonadFail Tx where
+    fail x = logAction (TxLogMessage x) >>
+             abort
 
 type TxnStepsChan = Chan TxnStep
 
 move :: Movement -> Tx MoveResult
-move movement = liftF (MoveTx movement id)
+move movement = Tx $ liftF (MoveTx movement id)
 
 moveOOB :: Zipper -> Movement -> Tx (Zipper, MoveResult)
-moveOOB z movement = liftF (MoveOOBTx z movement id)
+moveOOB z movement = Tx $ liftF (MoveOOBTx z movement id)
 
 cur :: Tx CurResult
-cur = liftF (CurTx id)
+cur = Tx $ liftF (CurTx id)
 
 cut :: Tx Zipper
-cut = liftF (CutTx id)
+cut = Tx $ liftF (CutTx id)
 
 curTy :: Tx (ZippyT, ZippySchema)
-curTy = liftF (CurTyTx id)
+curTy = Tx $ liftF (CurTyTx id)
 
 childRef :: Int -> Tx (Maybe SZippyD)
-childRef which = liftF (ChildRefTx which id)
+childRef which = Tx $ liftF (ChildRefTx which id)
 
 parentArgHole :: Tx (Maybe Int)
-parentArgHole = liftF (ParentArgHoleTx id)
+parentArgHole = Tx $ liftF (ParentArgHoleTx id)
 
 -- | Attempts to commit the current transaction.
 --
 --   This function terminates the Tx monad. Handling the result
 --   of a commit should be handled by the interpreter.
 commit :: Tx TxCommitStatus
-commit = liftF (CommitTx id)
+commit = Tx $ liftF (CommitTx id)
 
 -- | Causes the transaction to ensure that it could be operating on the
 --   most recently commited version of the database.
@@ -368,16 +373,16 @@ commit = liftF (CommitTx id)
 --   that the complex operation never has to be re-run because of a failure later
 --   on in the transaction.
 rebase :: RebaseFailureMode -> Tx ()
-rebase failMode = liftF (RebaseTx failMode ())
+rebase failMode = Tx $ liftF (RebaseTx failMode ())
 
 abort :: Tx a
-abort = liftF AbortTx
+abort = Tx $ liftF AbortTx
 
 logAction :: TxLogAction -> Tx ()
-logAction act = liftF (LogActionTx act ())
+logAction act = Tx $ liftF (LogActionTx act ())
 
 randomIntTx :: Tx Int64
-randomIntTx = liftF (RandomTx id)
+randomIntTx = Tx $ liftF (RandomTx id)
 
 -- ** Multiple concurrent transactions
 

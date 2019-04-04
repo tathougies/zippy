@@ -225,6 +225,9 @@ writeCompositeD eofPos tag args = ( entities
           writeInMemoryArg (SZippyD (IntegerD i)) = writeIntegerD i
           writeInMemoryArg _ = error "Should have written complex args to disk"
 
+          writeArg :: ( Word64, [ ( Word64, InMemoryD ) ], [ SZippyD ] -> [ SZippyD ], FixedLengthBuilder )
+                   -> SZippyD
+                   -> ( Word64, [ ( Word64, InMemoryD ) ], [ SZippyD ] -> [ SZippyD ], FixedLengthBuilder )
           writeArg (!eofPos, entities, args, argsBuilder) argD =
               case argD of
                 SZippyD arg@(TextD t) -> let txtBuilder = writeTextD t

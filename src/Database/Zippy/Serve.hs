@@ -22,7 +22,6 @@ import qualified Control.Exception as E
 import           Data.ByteString (ByteString)
 import           Data.ByteString.Builder hiding (word8)
 import qualified Data.ByteString.Streaming.Char8 as SBS
-import           Data.Conduit
 import           Data.Char
 -- import Data.Conduit.Binary
 -- import Data.Conduit.Network (sourceSocket, sinkSocket)
@@ -37,19 +36,20 @@ import qualified Data.Text.Encoding as TE
 
 import           Data.Attoparsec as Atto
 import           Data.Attoparsec.ByteString
+import qualified Data.Attoparsec.ByteString.Streaming as A
 
 import qualified Data.HashMap.Strict as HM
-import qualified Data.Conduit.List as CL
 import qualified Data.ByteString.Char8 as BS
 
 import           Foreign.Marshal.Alloc
 import           Foreign.Storable
 
-import           Network.Simple.TCP (listen, HostPreference(..))
-import           Network.Socket hiding (listen)
+import           Network.Simple.TCP ( Socket, SockAddr
+                                    , HostPreference(..)
+                                    , withSocketsDo, serve, send)
 import qualified Network.Socket.ByteString as NSB
 
-import           Streaming ( Of(..), Stream, inspect )
+import           Streaming as S ( Of(..), Stream, inspect )
 
 import           System.IO
 import           System.Log.Logger
@@ -57,8 +57,8 @@ import           System.Random
 import           System.Directory
 import           System.FilePath
 
-import           Text.Read hiding (lift)
 import qualified Text.Parsec as Parsec
+import           Text.Read hiding (lift)
 --import Text.Parsec.ByteString
 
 data ZippyServeSettings =
@@ -144,119 +144,120 @@ requestServer txnsChan txnId nextTxnId exportedZephyr sch curTy input =
     do res <- lift (inspect input)
        case res of
          Left () -> pure ()
-         Right (cmd :> input') -> do
-           (res, input'') <- A.parse (cmd sch curTy) cmd
-           isNull :> input''' <- lift (SBS.null input'')
+         Right cmdBytes -> do
+           (res, input') <- lift (A.parse (cmdP sch curTy) cmdBytes)
+           isNull S.:> input'' <- lift (SBS.null input')
 
            let continueWithType curTy' =
-                   requestServer txnsChan txnId nextTxnId exportedZephyr sch curTy' input'''
-           if isNull then SBS.chunk "Extra at end of command\n")
-                     else continueWithTye curTy
+                   requestServer txnsChan txnId nextTxnId exportedZephyr sch curTy' input''
+           if not isNull then SBS.chunk "Extra at end of command\n" >> continueWithType curTy
+             else case res of
+               Left err -> do
+                 SBS.chunk (fromString ("Cannot parse this cmd: " ++ show err ++ "\n"))
+                 continueWithType curTy
+               Right CurTyCmd -> do
+                 SBS.chunk (fromString (show curTy ++ "\n"))
+                 continueWithType curTy
+               Right MoveUpCmd -> do
+                 res <- lift $ interpretTxAsync sch ResyncAfterTx txnsChan simpleTxActionLogger txnId (move Up)
+                 let (res', newTy) = case res of
+                                       Moved newTy -> ("Moved\n", newTy)
+                                       _ -> (fromString (show res ++ "\n"), curTy)
+                 SBS.chunk res'
+                 continueWithType newTy
+               Right (MoveDownCmd i) -> do
+                 res <- lift $ interpretTxAsync sch ResyncAfterTx txnsChan simpleTxActionLogger txnId (move (Down i))
+                 let (res', newTy) = case res of
+                                       Moved newTy -> ("Moved\n", newTy)
+                                       _ -> (fromString (show res ++ "\n"), curTy)
+                 SBS.chunk res'
+                 continueWithType newTy
+               Right CurCmd -> do
+                 liftIO $ infoM "serveRequest" "Running CurCmd"
+                 res <- lift $ interpretTxAsync sch ResyncAfterTx txnsChan simpleTxActionLogger txnId cur
+                 SBS.chunk (fromString (show res ++ "\n"))
+                 continueWithType curTy
+               Right (ReplaceCmd d) ->
+                 case Parsec.parse (parseZippyD curTy sch) "<network>" d of
+                   Left err -> do
+                     SBS.chunk ("Could not parse data of type " <> fromString (show curTy) <> "\n")
+                     continueWithType curTy
+                   Right d -> do
+                     liftIO $ infoM "serveRequest" ("Replace with " ++ show d)
+                     res <- lift $ interpretTxAsync sch ResyncAfterTx txnsChan simpleTxActionLogger txnId (move (Replace d))
+                     SBS.chunk (fromString (show res ++ "\n"))
+                     continueWithType curTy
+               Right (FindInTreapCmd i) -> do
+                 liftIO $ infoM "serveRequest" ("Find in treap " ++ show i)
+                 res <- lift $ interpretTxAsync sch ResyncAfterTx txnsChan simpleTxActionLogger txnId (treapFind 0 (atomCmp (InMemoryD (IntegerD i))))
+                 SBS.chunk (fromString (show res ++ "\n"))
+                 continueWithType curTy
+               Right (InsertInTreapCmd i t) -> do
+                 liftIO $ infoM "serveRequest" ("Insert in treap " ++ show i ++ " " ++ show t)
+                 prio <- liftIO randomIO
+                 res <- lift $ interpretTxAsync sch DontResyncAfterTx txnsChan simpleTxActionLogger txnId (treapInsert prio (InMemoryD (IntegerD i)) (InMemoryD (TextD t)) >> commit)
+                 SBS.chunk (fromString (show res ++ "\n"))
+                 continueWithType curTy
+               Right CommitCmd -> do
+                 liftIO $ infoM "serveRequest" "Requesting commit"
+                 status <- lift $ commitAndWaitForStatus txnsChan txnId
+                 SBS.chunk (fromString (show status ++ "\n"))
+                 continueWithType curTy
+               Right NewTxnCmd -> do
+                 txnId <- liftIO nextTxnId
+                 SBS.chunk "BEGIN\n"
+                 continueWithType (zippySchemaRootType sch)
+               Right ListZephyrCmds -> do
+                 let keys = map (\(ZephyrWord t) -> TE.encodeUtf8 t) (HM.keys exportedZephyr)
+                 SBS.chunk ("QUERIES " <> BS.intercalate " " keys <> "\n")
+                 continueWithType curTy
+               Right (ZephyrQueryCmd commitAfter cmdName stk) ->
+                   do liftIO $ infoM "serveRequest" "testing zephyr"
+                      case parseZephyrStack stk of
+                        Left err -> SBS.chunk (fromString ("error parsing stack: " ++ show err ++ "\n")) >>
+                                    continueWithType curTy
+                        Right stk ->
+                          case HM.lookup (ZephyrWord cmdName) exportedZephyr of
+                            Just zephyrProg -> do
+                              rawLogChan <- liftIO newChan
+                              wireLogChan <- liftIO newChan
+                              resV <- liftIO newEmptyMVar
 
-           case res of
-             Left err -> do
-               SBS.chunk (fromString ("Cannot parse this cmd: " ++ show err ++ "\n"))
-               continueWithType curTy
-             Right CurTyCmd -> do
-               SBS.chunk (fromString (show curTy ++ "\n"))
-               continueWithType curTy
-             Right MoveUpCmd -> do
-               res <- lift $ interpretTxAsync sch ResyncAfterTx txnsChan simpleTxActionLogger txnId (move Up)
-               let (res', newTy) = case res of
-                                     Moved newTy -> ("Moved\n", newTy)
-                                     _ -> (fromString (show res ++ "\n"), curTy)
-               SBS.chunk res'
-               continueWithType newTy
-             Right (MoveDownCmd i) -> do
-               res <- lift $ interpretTxAsync sch ResyncAfterTx txnsChan simpleTxActionLogger txnId (move (Down i))
-               let (res', newTy) = case res of
-                                     Moved newTy -> ("Moved\n", newTy)
-                                     _ -> (fromString (show res ++ "\n"), curTy)
-               SBS.chunk res'
-               continueWithType newTy
-             Right CurCmd -> do
-               liftIO $ infoM "serveRequest" "Running CurCmd"
-               res <- lift $ interpretTxAsync sch ResyncAfterTx txnsChan simpleTxActionLogger txnId cur
-               SBS.chunk (fromString (show res ++ "\n"))
-               continueWithType curTy
-             Right (ReplaceCmd d) ->
-               case Parsec.parse (parseZippyD curTy sch) "<network>" d of
-                 Left err -> do
-                   SBS.chunk ("Could not parse data of type " <> fromString (show curTy) <> "\n")
-                   continueWithType curTy
-                 Right d -> do
-                   liftIO $ infoM "serveRequest" ("Replace with " ++ show d)
-                   res <- lift $ interpretTxAsync sch ResyncAfterTx txnsChan simpleTxActionLogger txnId (move (Replace d))
-                   SBS.chunk (fromString (show res ++ "\n"))
-                   continueWithType curTy
-             Right (FindInTreapCmd i) -> do
-               liftIO $ infoM "serveRequest" ("Find in treap " ++ show i)
-               res <- lift $ interpretTxAsync sch ResyncAfterTx txnsChan simpleTxActionLogger txnId (treapFind 0 (atomCmp (InMemoryD (IntegerD i))))
-               SBS.chunk (fromString (show res ++ "\n"))
-               continueWithType curTy
-             Right (InsertInTreapCmd i t) -> do
-               liftIO $ infoM "serveRequest" ("Insert in treap " ++ show i ++ " " ++ show t)
-               prio <- liftIO randomIO
-               res <- lift $ interpretTxAsync sch DontResyncAfterTx txnsChan simpleTxActionLogger txnId (treapInsert prio (InMemoryD (IntegerD i)) (InMemoryD (TextD t)) >> commit)
-               SBS.chunk (fromString (show res ++ "\n"))
-               continueWithType curTy
-             Right CommitCmd -> do
-               liftIO $ infoM "serveRequest" "Requesting commit"
-               status <- lift $ commitAndWaitForStatus txnsChan txnId
-               SBS.chunk (fromString (show status ++ "\n"))
-               continueWithType curTy
-             Right NewTxnCmd -> do
-               txnId <- liftIO nextTxnId
-               SBS.chunk "BEGIN\n"
-               continueWithType (zippySchemaRootType sch)
-             Right ListZephyrCmds -> do
-               let keys = map (\(ZephyrWord t) -> TE.encodeUtf8 t) (HM.keys exportedZephyr)
-               SBS.chunk ("QUERIES " <> BS.intercalate " " keys <> "\n")
-               continueWithType curTy
-             Right (ZephyrQueryCmd commitAfter cmdName stk) ->
-                 do liftIO $ infoM "serveRequest" "testing zephyr"
-                    case parseZephyrStack stk of
-                      Left err -> SBS.chunk (fromString ("error parsing stack: " ++ show err ++ "\n")) >>
-                                  continueWithType curTy
-                      Right stk ->
-                        case HM.lookup (ZephyrWord cmdName) exportedZephyr of
-                          Just zephyrProg -> do
-                            rawLogChan <- liftIO newChan
-                            wireLogChan <- liftIO newChan
-                            resV <- liftIO newEmptyMVar
+                              liftIO . forkIO $ do
+                                res <- interpretTxAsync sch (if commitAfter then DontResyncAfterTx else ResyncAfterTx) txnsChan (txResultActionLogger rawLogChan) txnId $
+                                       do res <- runZephyr zephyrProg sch (reverse stk)
+                                          commitRes <- if commitAfter then Just <$> commit else pure Nothing
+                                          return (res, commitRes)
 
-                            liftIO . forkIO $ do
-                              res <- interpretTxAsync sch (if commitAfter then DontResyncAfterTx else ResyncAfterTx) txnsChan (txResultActionLogger rawLogChan) txnId $
-                                     do res <- runZephyr zephyrProg sch (reverse stk)
-                                        commitRes <- if commitAfter then Just <$> commit else pure Nothing
-                                        return (res, commitRes)
-                              writeChan rawLogChan Nothing
-                              putMVar resV res
+                                writeChan rawLogChan Nothing
+                                putMVar resV res
 
-                            liftIO (forkIO (buildWireBuilders curTy sch txnId txnsChan rawLogChan wireLogChan))
+                              liftIO (forkIO (buildWireBuilders curTy sch txnId txnsChan rawLogChan wireLogChan))
 
-                            let getBuilders = do res <- liftIO (readChan wireLogChan)
-                                                 case res of
-                                                   Just builder -> do
-                                                     SBS.chunk "RES "
-                                                     SBS.toStreamingByteString builder
-                                                     SBS.chunk "\n"
-                                                     getBuilders
-                                                   Nothing -> return ()
-                                liftYield = await >>= \x ->
-                                            case x of
-                                              Nothing -> return ()
-                                              Just x -> lift (yield x) >> liftYield
+                              let getBuilders = do res <- liftIO (readChan wireLogChan)
+                                                   liftIO (infoM "serveRequest" ("Got result " ++ (show (() <$ res))))
+                                                   case res of
+                                                     Just builder -> do
+                                                       SBS.chunk "RES "
+                                                       SBS.toStreamingByteString builder
+                                                       SBS.chunk "\n"
+                                                       getBuilders
+                                                     Nothing -> return ()
+  --                                liftYield = await >>= \x ->
+  --                                            case x of
+  --                                              Nothing -> return ()
+  --                                              Just x -> lift (yield x) >> liftYield
 
-                            (res, commitRes) <- liftIO (takeMVar resV)
-                            SBS.chunk ("ALL DONE" <> fromString (show res) <> "\n")
-                            case commitRes of
-                              Nothing -> pure ()
-                              Just commitRes -> SBS.chunk (fromString (show commitRes <> "\n"))
-                            continueWithType curTy
-                          Nothing -> do
-                            SBS.chunk (fromString ("No such zephyr query: " ++ show cmdName ++ "\n"))
-                            continueWithType curTy
+                              getBuilders
+                              (res, commitRes) <- liftIO (takeMVar resV)
+                              SBS.chunk ("ALL DONE" <> fromString (show res) <> "\n")
+                              case commitRes of
+                                Nothing -> pure ()
+                                Just commitRes -> SBS.chunk (fromString (show commitRes <> "\n"))
+                              continueWithType curTy
+                            Nothing -> do
+                              SBS.chunk (fromString ("No such zephyr query: " ++ show cmdName ++ "\n"))
+                              continueWithType curTy
 
 buildWireBuilders :: ZippyT -> ZippySchema -> TxnId -> TxnStepsChan -> Chan (Maybe Zipper) -> Chan (Maybe Builder) -> IO ()
 buildWireBuilders curTy sch txnId txnsChan zChan builderChan = emptyAsyncDiskState txnsChan txnId >>=
@@ -269,20 +270,21 @@ buildWireBuilders curTy sch txnId txnsChan zChan builderChan = emptyAsyncDiskSta
                        do (b, diskState') <- canonicalBuilderForZipper diskState sch z
                           writeChan builderChan (Just b)
                           buildWireBuilders' diskState
+--
+--statefulConduit :: Monad m => (b -> a -> m b) -> b -> Conduit a m b
+--statefulConduit f st = await >>= \x ->
+--                       case x of
+--                         Nothing -> return ()
+--                         Just x  -> do st' <- lift (f st x)
+--                                       yield st'
+--                                       statefulConduit f st'
 
-statefulConduit :: Monad m => (b -> a -> m b) -> b -> Conduit a m b
-statefulConduit f st = await >>= \x ->
-                       case x of
-                         Nothing -> return ()
-                         Just x  -> do st' <- lift (f st x)
-                                       yield st'
-                                       statefulConduit f st'
-
-serveClient :: TxnStepsChan -> IO TxnId -> ZephyrExports -> ZippySchema -> (Socket, SockAddr) -> ServeM ()
+serveClient :: TxnStepsChan -> IO TxnId -> ZephyrExports
+            -> ZippySchema -> (Socket, SockAddr) -> ServeM ()
 serveClient txnsChan nextTxnId exportedZephyr sch (sock, sockAddr) =
     do infoM "serveClient" ("New connection from " ++ show sockAddr)
        txnId <- nextTxnId
-       toSocket sock (requestServer txnsChan txnId nextTxnId exortedZehyr sch (zippySchemaRootType sch) (SBS.lines (fromSocket 4096 sock)))
+       toSocket sock (requestServer txnsChan txnId nextTxnId exportedZephyr sch (zippySchemaRootType sch) (SBS.lines (fromSocket sock 4096)))
 
 findRootFromRootsFile :: FilePath -> IO Word64
 findRootFromRootsFile fp = withBinaryFile fp ReadWriteMode $ \h ->
@@ -341,8 +343,8 @@ serveZippy (ZippyServeSettings { .. }) =
                 forkIO (txnServe stepsChan st)
 
                 -- Start network server
-                withSocketsDo $ listen HostAny (show serverPort)
-                      (serveClient stepsChan nextTxnId exports schema (sock, addr))
+                withSocketsDo $ serve HostAny (show serverPort)
+                      (serveClient stepsChan nextTxnId exports schema)
 
 fromSocket
   :: MonadIO m
@@ -354,7 +356,7 @@ fromSocket
 fromSocket sock nbytes = loop where
   loop = do
     bs <- liftIO (NSB.recv sock nbytes)
-    if B.null bs
+    if BS.null bs
       then return ()
       else SBS.chunk bs >> loop
 {-# INLINABLE fromSocket #-}
